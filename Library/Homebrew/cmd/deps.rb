@@ -1,157 +1,312 @@
-#:  * `deps` [`--1`] [`-n`] [`--union`] [`--full-name`] [`--installed`] [`--include-build`] [`--include-optional`] [`--skip-recommended`] <formulae>:
-#:    Show dependencies for <formulae>. When given multiple formula arguments,
-#:    show the intersection of dependencies for <formulae>.
-#:
-#:    If `--1` is passed, only show dependencies one level down, instead of
-#:    recursing.
-#:
-#:    If `-n` is passed, show dependencies in topological order.
-#:
-#:    If `--union` is passed, show the union of dependencies for <formulae>,
-#:    instead of the intersection.
-#:
-#:    If `--full-name` is passed, list dependencies by their full name.
-#:
-#:    If `--installed` is passed, only list those dependencies that are
-#:    currently installed.
-#:
-#:    By default, `deps` shows required and recommended dependencies for
-#:    <formulae>. To include the `:build` type dependencies, pass `--include-build`.
-#:    Similarly, pass `--include-optional` to include `:optional` dependencies.
-#:    To skip `:recommended` type dependencies, pass `--skip-recommended`.
-#:
-#:  * `deps` `--tree` [<filters>] (<formulae>|`--installed`):
-#:    Show dependencies as a tree. When given multiple formula arguments, output
-#:    individual trees for every formula.
-#:
-#:    If `--installed` is passed, output a tree for every installed formula.
-#:
-#:    The <filters> placeholder is any combination of options `--include-build`,
-#:    `--include-optional`, and `--skip-recommended` as documented above.
-#:
-#:  * `deps` [<filters>] (`--installed`|`--all`):
-#:    Show dependencies for installed or all available formulae. Every line of
-#:    output starts with the formula name, followed by a colon and all direct
-#:    dependencies of that formula.
-#:
-#:    The <filters> placeholder is any combination of options `--include-build`,
-#:    `--include-optional`, and `--skip-recommended` as documented above.
+# typed: false
+# frozen_string_literal: true
 
-# encoding: UTF-8
 require "formula"
 require "ostruct"
+require "cli/parser"
+require "cask/caskroom"
+require "dependencies_helpers"
 
 module Homebrew
+  extend T::Sig
+
+  extend DependenciesHelpers
+
   module_function
 
-  def deps
-    mode = OpenStruct.new(
-      installed?: ARGV.include?("--installed"),
-      tree?: ARGV.include?("--tree"),
-      all?: ARGV.include?("--all"),
-      topo_order?: ARGV.include?("-n"),
-      union?: ARGV.include?("--union")
-    )
+  sig { returns(CLI::Parser) }
+  def deps_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Show dependencies for <formula>. Additional options specific to <formula>
+        may be appended to the command. When given multiple formula arguments,
+        show the intersection of dependencies for each formula.
+      EOS
+      switch "-n",
+             description: "Sort dependencies in topological order."
+      switch "--1",
+             description: "Only show dependencies one level down, instead of recursing."
+      switch "--union",
+             description: "Show the union of dependencies for multiple <formula>, instead of the intersection."
+      switch "--full-name",
+             description: "List dependencies by their full name."
+      switch "--include-build",
+             description: "Include `:build` dependencies for <formula>."
+      switch "--include-optional",
+             description: "Include `:optional` dependencies for <formula>."
+      switch "--include-test",
+             description: "Include `:test` dependencies for <formula> (non-recursive)."
+      switch "--skip-recommended",
+             description: "Skip `:recommended` dependencies for <formula>."
+      switch "--include-requirements",
+             description: "Include requirements in addition to dependencies for <formula>."
+      switch "--tree",
+             description: "Show dependencies as a tree. When given multiple formula arguments, " \
+                          "show individual trees for each formula."
+      switch "--graph",
+             description: "Show dependencies as a directed graph."
+      switch "--dot",
+             depends_on:  "--graph",
+             description: "Show text-based graph description in DOT format."
+      switch "--annotate",
+             description: "Mark any build, test, optional, or recommended dependencies as " \
+                          "such in the output."
+      switch "--installed",
+             description: "List dependencies for formulae that are currently installed. If <formula> is " \
+                          "specified, list only its dependencies that are currently installed."
+      switch "--all",
+             description: "List dependencies for all available formulae."
+      switch "--for-each",
+             description: "Switch into the mode used by the `--all` option, but only list dependencies " \
+                          "for each provided <formula>, one formula per line. This is used for " \
+                          "debugging the `--installed`/`--all` display mode."
+      switch "--formula", "--formulae",
+             depends_on:  "--installed",
+             description: "Treat all named arguments as formulae."
+      switch "--cask", "--casks",
+             depends_on:  "--installed",
+             description: "Treat all named arguments as casks."
 
-    if mode.installed? && mode.tree?
-      puts_deps_tree Formula.installed
-    elsif mode.all?
-      puts_deps Formula
-    elsif mode.tree?
-      raise FormulaUnspecifiedError if ARGV.named.empty?
-      puts_deps_tree ARGV.formulae
-    elsif ARGV.named.empty?
-      raise FormulaUnspecifiedError unless mode.installed?
-      puts_deps Formula.installed
-    else
-      all_deps = deps_for_formulae(ARGV.formulae, !ARGV.one?, &(mode.union? ? :| : :&))
-      all_deps = all_deps.select(&:installed?) if mode.installed?
-      all_deps = if ARGV.include? "--full-name"
-        all_deps.map(&:to_formula).map(&:full_name)
-      else
-        all_deps.map(&:name)
-      end.uniq
-      all_deps.sort! unless mode.topo_order?
-      puts all_deps
+      conflicts "--tree", "--graph"
+      conflicts "--installed", "--all"
+      conflicts "--formula", "--cask"
+      formula_options
+
+      named_args [:formula, :cask]
     end
   end
 
-  def deps_for_formula(f, recursive = false)
-    includes = []
-    ignores = []
-    if ARGV.include? "--include-build"
-      includes << "build?"
-    else
-      ignores << "build?"
+  def deps
+    args = deps_args.parse
+
+    Formulary.enable_factory_cache!
+
+    recursive = !args.send(:"1?")
+    installed = args.installed? || dependents(args.named.to_formulae_and_casks).all?(&:any_version_installed?)
+
+    @use_runtime_dependencies = installed && recursive &&
+                                !args.tree? &&
+                                !args.graph? &&
+                                !args.include_build? &&
+                                !args.include_test? &&
+                                !args.include_optional? &&
+                                !args.skip_recommended?
+
+    if args.tree? || args.graph?
+      dependents = if args.named.present?
+        sorted_dependents(args.named.to_formulae_and_casks)
+      elsif args.installed?
+        case args.only_formula_or_cask
+        when :formula
+          sorted_dependents(Formula.installed)
+        when :cask
+          sorted_dependents(Cask::Caskroom.casks)
+        else
+          sorted_dependents(Formula.installed + Cask::Caskroom.casks)
+        end
+      else
+        raise FormulaUnspecifiedError
+      end
+
+      if args.graph?
+        dot_code = dot_code(dependents, recursive: recursive, args: args)
+        if args.dot?
+          puts dot_code
+        else
+          exec_browser "https://dreampuf.github.io/GraphvizOnline/##{ERB::Util.url_encode(dot_code)}"
+        end
+        return
+      end
+
+      puts_deps_tree dependents, recursive: recursive, args: args
+      return
+    elsif args.all?
+      puts_deps sorted_dependents(Formula.all + Cask::Cask.all), recursive: recursive, args: args
+      return
+    elsif !args.no_named? && args.for_each?
+      puts_deps sorted_dependents(args.named.to_formulae_and_casks), recursive: recursive, args: args
+      return
     end
-    if ARGV.include? "--include-optional"
-      includes << "optional?"
-    else
-      ignores << "optional?"
+
+    if args.no_named?
+      raise FormulaUnspecifiedError unless args.installed?
+
+      sorted_dependents_formulae_and_casks = case args.only_formula_or_cask
+      when :formula
+        sorted_dependents(Formula.installed)
+      when :cask
+        sorted_dependents(Cask::Caskroom.casks)
+      else
+        sorted_dependents(Formula.installed + Cask::Caskroom.casks)
+      end
+      puts_deps sorted_dependents_formulae_and_casks, recursive: recursive, args: args
+      return
     end
-    ignores << "recommended?" if ARGV.include? "--skip-recommended"
+
+    dependents = dependents(args.named.to_formulae_and_casks)
+
+    all_deps = deps_for_dependents(dependents, recursive: recursive, args: args, &(args.union? ? :| : :&))
+    condense_requirements(all_deps, args: args)
+    all_deps.map! { |d| dep_display_name(d, args: args) }
+    all_deps.uniq!
+    all_deps.sort! unless args.n?
+    puts all_deps
+  end
+
+  def sorted_dependents(formulae_or_casks)
+    dependents(formulae_or_casks).sort_by(&:name)
+  end
+
+  def condense_requirements(deps, args:)
+    deps.select! { |dep| dep.is_a?(Dependency) } unless args.include_requirements?
+    deps.select! { |dep| dep.is_a?(Requirement) || dep.installed? } if args.installed?
+  end
+
+  def dep_display_name(dep, args:)
+    str = if dep.is_a? Requirement
+      if args.include_requirements?
+        ":#{dep.display_s}"
+      else
+        # This shouldn't happen, but we'll put something here to help debugging
+        "::#{dep.name}"
+      end
+    elsif args.full_name?
+      dep.to_formula.full_name
+    else
+      dep.name
+    end
+
+    if args.annotate?
+      str = "#{str} " if args.tree?
+      str = "#{str} [build]" if dep.build?
+      str = "#{str} [test]" if dep.test?
+      str = "#{str} [optional]" if dep.optional?
+      str = "#{str} [recommended]" if dep.recommended?
+    end
+
+    str
+  end
+
+  def deps_for_dependent(d, args:, recursive: false)
+    includes, ignores = args_includes_ignores(args)
+
+    deps = d.runtime_dependencies if @use_runtime_dependencies
 
     if recursive
-      deps = f.recursive_dependencies do |dependent, dep|
-        if dep.recommended?
-          Dependency.prune if ignores.include?("recommended?") || dependent.build.without?(dep)
-        elsif dep.optional?
-          Dependency.prune if !includes.include?("optional?") && !dependent.build.with?(dep)
-        elsif dep.build?
-          Dependency.prune unless includes.include?("build?")
-        end
-      end
-      reqs = f.recursive_requirements do |dependent, req|
-        if req.recommended?
-          Requirement.prune if ignores.include?("recommended?") || dependent.build.without?(req)
-        elsif req.optional?
-          Requirement.prune if !includes.include?("optional?") && !dependent.build.with?(req)
-        elsif req.build?
-          Requirement.prune unless includes.include?("build?")
-        end
-      end
+      deps ||= recursive_includes(Dependency, d, includes, ignores)
+      reqs   = recursive_includes(Requirement, d, includes, ignores)
     else
-      deps = f.deps.reject do |dep|
-        ignores.any? { |ignore| dep.send(ignore) } && !includes.any? { |include| dep.send(include) }
-      end
-      reqs = f.requirements.reject do |req|
-        ignores.any? { |ignore| req.send(ignore) } && !includes.any? { |include| req.send(include) }
-      end
+      deps ||= reject_ignores(d.deps, ignores, includes)
+      reqs   = reject_ignores(d.requirements, ignores, includes)
     end
 
-    deps + reqs.select(&:default_formula?).map(&:to_dependency)
+    deps + reqs.to_a
   end
 
-  def deps_for_formulae(formulae, recursive = false, &block)
-    formulae.map { |f| deps_for_formula(f, recursive) }.inject(&block)
+  def deps_for_dependents(dependents, args:, recursive: false, &block)
+    dependents.map { |d| deps_for_dependent(d, recursive: recursive, args: args) }.reduce(&block)
   end
 
-  def puts_deps(formulae)
-    formulae.each { |f| puts "#{f.full_name}: #{deps_for_formula(f).sort_by(&:name) * " "}" }
+  def puts_deps(dependents, args:, recursive: false)
+    dependents.each do |dependent|
+      deps = deps_for_dependent(dependent, recursive: recursive, args: args)
+      condense_requirements(deps, args: args)
+      deps.sort_by!(&:name)
+      deps.map! { |d| dep_display_name(d, args: args) }
+      puts "#{dependent.full_name}: #{deps.join(" ")}"
+    end
   end
 
-  def puts_deps_tree(formulae)
-    formulae.each do |f|
-      puts "#{f.full_name} (required dependencies)"
-      recursive_deps_tree(f, "")
+  def dot_code(dependents, recursive:, args:)
+    dep_graph = {}
+    dependents.each do |d|
+      graph_deps(d, dep_graph: dep_graph, recursive: recursive, args: args)
+    end
+
+    dot_code = dep_graph.map do |d, deps|
+      deps.map do |dep|
+        attributes = []
+        attributes << "style = dotted" if dep.build?
+        attributes << "arrowhead = empty" if dep.test?
+        if dep.optional?
+          attributes << "color = red"
+        elsif dep.recommended?
+          attributes << "color = green"
+        end
+        comment = " # #{dep.tags.map(&:inspect).join(", ")}" if dep.tags.any?
+        "  \"#{d.name}\" -> \"#{dep}\"#{" [#{attributes.join(", ")}]" if attributes.any?}#{comment}"
+      end
+    end.flatten.join("\n")
+    "digraph {\n#{dot_code}\n}"
+  end
+
+  def graph_deps(f, dep_graph:, recursive:, args:)
+    return if dep_graph.key?(f)
+
+    dependables = dependables(f, args: args)
+    dep_graph[f] = dependables
+    return unless recursive
+
+    dependables.each do |dep|
+      next unless dep.is_a? Dependency
+
+      graph_deps(Formulary.factory(dep.name),
+                 dep_graph: dep_graph,
+                 recursive: true,
+                 args:      args)
+    end
+  end
+
+  def puts_deps_tree(dependents, args:, recursive: false)
+    dependents.each do |d|
+      puts d.full_name
+      recursive_deps_tree(d, dep_stack: [], prefix: "", recursive: recursive, args: args)
       puts
     end
   end
 
-  def recursive_deps_tree(f, prefix)
-    reqs = f.requirements.select(&:default_formula?)
-    max = reqs.length - 1
-    reqs.each_with_index do |req, i|
-      chr = i == max ? "└──" : "├──"
-      puts prefix + "#{chr} :#{req.to_dependency.name}"
+  def dependables(f, args:)
+    includes, ignores = args_includes_ignores(args)
+    deps = @use_runtime_dependencies ? f.runtime_dependencies : f.deps
+    deps = reject_ignores(deps, ignores, includes)
+    reqs = reject_ignores(f.requirements, ignores, includes) if args.include_requirements?
+    reqs ||= []
+    reqs + deps
+  end
+
+  def recursive_deps_tree(f, dep_stack:, prefix:, recursive:, args:)
+    dependables = dependables(f, args: args)
+    max = dependables.length - 1
+    dep_stack.push f.name
+    dependables.each_with_index do |dep, i|
+      tree_lines = if i == max
+        "└──"
+      else
+        "├──"
+      end
+
+      display_s = "#{tree_lines} #{dep_display_name(dep, args: args)}"
+      is_circular = dep_stack.include?(dep.name)
+      display_s = "#{display_s} (CIRCULAR DEPENDENCY)" if is_circular
+      puts "#{prefix}#{display_s}"
+
+      next if !recursive || is_circular
+
+      prefix_addition = if i == max
+        "    "
+      else
+        "│   "
+      end
+
+      next unless dep.is_a? Dependency
+
+      recursive_deps_tree(Formulary.factory(dep.name),
+                          dep_stack: dep_stack,
+                          prefix:    prefix + prefix_addition,
+                          recursive: true,
+                          args:      args)
     end
-    deps = f.deps.default
-    max = deps.length - 1
-    deps.each_with_index do |dep, i|
-      chr = i == max ? "└──" : "├──"
-      prefix_ext = i == max ? "    " : "│   "
-      puts prefix + "#{chr} #{dep.name}"
-      recursive_deps_tree(Formulary.factory(dep.name), prefix + prefix_ext)
-    end
+
+    dep_stack.pop
   end
 end

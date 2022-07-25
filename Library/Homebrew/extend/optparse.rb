@@ -1,5 +1,7 @@
+# typed: strict
+# frozen_string_literal: true
+
 require "optparse"
-require "pathname"
 
 OptionParser.accept Pathname do |path|
   Pathname(path).expand_path if path

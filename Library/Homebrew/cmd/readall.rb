@@ -1,37 +1,47 @@
-#: @hide_from_man_page
-#:  * `readall` [tap]:
-#:    Import all formulae in a tap (defaults to core tap).
-#:
-#:    This can be useful for debugging issues across all formulae
-#:    when making significant changes to `formula.rb`,
-#:    or to determine if any current formulae have Ruby issues
+# typed: true
+# frozen_string_literal: true
 
 require "readall"
+require "cli/parser"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
+  sig { returns(CLI::Parser) }
+  def readall_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Import all items from the specified <tap>, or from all installed taps if none is provided.
+        This can be useful for debugging issues across all items when making
+        significant changes to `formula.rb`, testing the performance of loading
+        all items or checking if any current formulae/casks have Ruby issues.
+      EOS
+      switch "--aliases",
+             description: "Verify any alias symlinks in each tap."
+      switch "--syntax",
+             description: "Syntax-check all of Homebrew's Ruby files (if no `<tap>` is passed)."
+
+      named_args :tap
+    end
+  end
+
   def readall
-    if ARGV.include?("--syntax")
-      ruby_files = []
-      scan_files = %W[
-        #{HOMEBREW_LIBRARY}/*.rb
-        #{HOMEBREW_LIBRARY}/Homebrew/**/*.rb
-      ]
-      Dir.glob(scan_files).each do |rb|
-        next if rb.include?("/vendor/")
-        next if rb.include?("/cask/")
-        ruby_files << rb
-      end
+    args = readall_args.parse
+
+    if args.syntax? && args.no_named?
+      scan_files = "#{HOMEBREW_LIBRARY_PATH}/**/*.rb"
+      ruby_files = Dir.glob(scan_files).grep_v(%r{/(vendor)/})
 
       Homebrew.failed = true unless Readall.valid_ruby_syntax?(ruby_files)
     end
 
-    options = { aliases: ARGV.include?("--aliases") }
-    taps = if ARGV.named.empty?
+    options = { aliases: args.aliases? }
+    taps = if args.no_named?
       Tap
     else
-      [Tap.fetch(ARGV.named.first)]
+      args.named.to_installed_taps
     end
     taps.each do |tap|
       Homebrew.failed = true unless Readall.valid_tap?(tap, options)

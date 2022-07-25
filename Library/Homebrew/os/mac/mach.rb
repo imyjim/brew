@@ -1,15 +1,21 @@
-require "vendor/macho/macho"
-require "os/mac/architecture_list"
+# typed: false
+# frozen_string_literal: true
 
+require "macho"
+
+# {Pathname} extension for dealing with Mach-O files.
+#
+# @api private
 module MachOShim
-  # @private
-  def macho
-    @macho ||= begin
-      MachO.open(to_s)
-    end
-  end
+  extend Forwardable
 
-  # @private
+  delegate [:dylib_id, :rpaths] => :macho
+
+  def macho
+    @macho ||= MachO.open(to_s)
+  end
+  private :macho
+
   def mach_data
     @mach_data ||= begin
       machos = []
@@ -23,7 +29,7 @@ module MachOShim
 
       machos.each do |m|
         arch = case m.cputype
-        when :x86_64, :i386, :ppc64 then m.cputype
+        when :x86_64, :i386, :ppc64, :arm64, :arm then m.cputype
         when :ppc then :ppc7400
         else :dunno
         end
@@ -43,26 +49,44 @@ module MachOShim
       []
     rescue
       # ... but complain about other (parse) errors for further investigation.
-      if ARGV.homebrew_developer?
-        onoe "Failed to read Mach-O binary: #{self}"
-        raise
-      end
+      onoe "Failed to read Mach-O binary: #{self}"
+      raise if Homebrew::EnvConfig.developer?
+
       []
     end
+  end
+  private :mach_data
+
+  # TODO: See if the `#write!` call can be delayed until
+  # we know we're not making any changes to the rpaths.
+  def delete_rpath(rpath, **options)
+    macho.delete_rpath(rpath, options)
+    macho.write!
+  end
+
+  def change_rpath(old, new, **options)
+    macho.change_rpath(old, new, options)
+    macho.write!
+  end
+
+  def change_dylib_id(id, **options)
+    macho.change_dylib_id(id, options)
+    macho.write!
+  end
+
+  def change_install_name(old, new, **options)
+    macho.change_install_name(old, new, options)
+    macho.write!
   end
 
   def dynamically_linked_libraries(except: :none)
     lcs = macho.dylib_load_commands.reject { |lc| lc.type == except }
 
-    lcs.map(&:name).map(&:to_s)
-  end
-
-  def dylib_id
-    macho.dylib_id
+    lcs.map(&:name).map(&:to_s).uniq
   end
 
   def archs
-    mach_data.map { |m| m.fetch :arch }.extend(ArchitectureListExtension)
+    mach_data.map { |m| m.fetch :arch }
   end
 
   def arch
@@ -93,17 +117,16 @@ module MachOShim
     arch == :ppc64
   end
 
-  # @private
   def dylib?
     mach_data.any? { |m| m.fetch(:type) == :dylib }
   end
 
-  # @private
   def mach_o_executable?
     mach_data.any? { |m| m.fetch(:type) == :executable }
   end
 
-  # @private
+  alias binary_executable? mach_o_executable?
+
   def mach_o_bundle?
     mach_data.any? { |m| m.fetch(:type) == :bundle }
   end

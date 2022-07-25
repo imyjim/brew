@@ -1,23 +1,35 @@
+# typed: strict
+# frozen_string_literal: true
+
 require "hardware"
 require "extend/ENV/shared"
 
-# TODO: deprecate compiling related codes after it's only used by brew test.
-# @private
+# @api private
 module Stdenv
+  extend T::Sig
+
   include SharedEnvExtension
 
   # @private
-  SAFE_CFLAGS_FLAGS = "-w -pipe".freeze
-  DEFAULT_FLAGS = "-march=core2 -msse4".freeze
-
-  def self.extended(base)
-    return if ORIGINAL_PATHS.include? HOMEBREW_PREFIX/"bin"
-    base.prepend_path "PATH", "#{HOMEBREW_PREFIX}/bin"
-  end
+  SAFE_CFLAGS_FLAGS = "-w -pipe"
 
   # @private
-  def setup_build_environment(formula = nil)
+  sig {
+    params(
+      formula:         T.nilable(Formula),
+      cc:              T.nilable(String),
+      build_bottle:    T.nilable(T::Boolean),
+      bottle_arch:     T.nilable(String),
+      testing_formula: T::Boolean,
+    ).void
+  }
+  def setup_build_environment(formula: nil, cc: nil, build_bottle: false, bottle_arch: nil, testing_formula: false)
     super
+
+    self["HOMEBREW_ENV"] = "std"
+
+    ORIGINAL_PATHS.reverse_each { |p| prepend_path "PATH", p }
+    prepend_path "PATH", HOMEBREW_SHIMS_PATH/"shared"
 
     # Set the default pkg-config search path, overriding the built-in paths
     # Anything in PKG_CONFIG_PATH is searched before paths in this variable
@@ -43,36 +55,38 @@ module Stdenv
     # Os is the default Apple uses for all its stuff so let's trust them
     define_cflags "-Os #{SAFE_CFLAGS_FLAGS}"
 
-    append "LDFLAGS", "-Wl,-headerpad_max_install_names"
-
     send(compiler)
 
-    return unless cc =~ GNU_GCC_REGEXP
-    gcc_formula = gcc_version_formula($&)
+    return unless cc&.match?(GNU_GCC_REGEXP)
+
+    gcc_formula = gcc_version_formula(cc)
     append_path "PATH", gcc_formula.opt_bin.to_s
   end
   alias generic_setup_build_environment setup_build_environment
 
+  sig { returns(T::Array[Pathname]) }
   def homebrew_extra_pkg_config_paths
     []
   end
 
+  sig { returns(T.nilable(PATH)) }
   def determine_pkg_config_libdir
-    paths = []
-    paths << "#{HOMEBREW_PREFIX}/lib/pkgconfig"
-    paths << "#{HOMEBREW_PREFIX}/share/pkgconfig"
-    paths += homebrew_extra_pkg_config_paths
-    paths << "/usr/lib/pkgconfig"
-    paths.select { |d| File.directory? d }.join(File::PATH_SEPARATOR)
+    PATH.new(
+      HOMEBREW_PREFIX/"lib/pkgconfig",
+      HOMEBREW_PREFIX/"share/pkgconfig",
+      homebrew_extra_pkg_config_paths,
+      "/usr/lib/pkgconfig",
+    ).existing
   end
 
   # Removes the MAKEFLAGS environment variable, causing make to use a single job.
   # This is useful for makefiles with race conditions.
   # When passed a block, MAKEFLAGS is removed only for the duration of the block and is restored after its completion.
-  def deparallelize
+  sig { params(block: T.proc.returns(T.untyped)).returns(T.untyped) }
+  def deparallelize(&block)
     old = self["MAKEFLAGS"]
     remove "MAKEFLAGS", /-j\d+/
-    if block_given?
+    if block
       begin
         yield
       ensure
@@ -82,129 +96,68 @@ module Stdenv
 
     old
   end
-  alias j1 deparallelize
 
-  # These methods are no-ops for compatibility.
-  %w[fast O4 Og].each { |opt| define_method(opt) {} }
-
-  %w[O3 O2 O1 O0 Os].each do |opt|
+  %w[O1 O0].each do |opt|
     define_method opt do
-      remove_from_cflags(/-O./)
-      append_to_cflags "-#{opt}"
+      send(:remove_from_cflags, /-O./)
+      send(:append_to_cflags, "-#{opt}")
     end
   end
 
-  # @private
+  sig { returns(T.any(String, Pathname)) }
   def determine_cc
     s = super
-    DevelopmentTools.locate(s) || Pathname.new(s)
+    DevelopmentTools.locate(s) || Pathname(s)
   end
+  private :determine_cc
 
-  # @private
+  sig { returns(Pathname) }
   def determine_cxx
-    dir, base = determine_cc.split
-    dir / base.to_s.sub("gcc", "g++").sub("clang", "clang++")
+    dir, base = Pathname(determine_cc).split
+    dir/base.to_s.sub("gcc", "g++").sub("clang", "clang++")
   end
-
-  def gcc_4_0
-    super
-    set_cpu_cflags "-march=nocona -mssse3"
-  end
-  alias gcc_4_0_1 gcc_4_0
-
-  def gcc
-    super
-    set_cpu_cflags
-  end
-  alias gcc_4_2 gcc
+  private :determine_cxx
 
   GNU_GCC_VERSIONS.each do |n|
     define_method(:"gcc-#{n}") do
       super()
-      set_cpu_cflags
+      send(:set_cpu_cflags)
     end
   end
 
+  sig { void }
   def clang
-    super
+    super()
     replace_in_cflags(/-Xarch_#{Hardware::CPU.arch_32_bit} (-march=\S*)/, '\1')
-    # Clang mistakenly enables AES-NI on plain Nehalem
-    map = Hardware::CPU.optimization_flags
-    map = map.merge(nehalem: "-march=native -Xclang -target-feature -Xclang -aes")
-    set_cpu_cflags "-march=native", map
-  end
-
-  def minimal_optimization
-    define_cflags "-Os #{SAFE_CFLAGS_FLAGS}"
-  end
-  alias generic_minimal_optimization minimal_optimization
-
-  def no_optimization
-    define_cflags SAFE_CFLAGS_FLAGS
-  end
-  alias generic_no_optimization no_optimization
-
-  def libxml2
-  end
-
-  def x11
-  end
-  alias libpng x11
-
-  # we've seen some packages fail to build when warnings are disabled!
-  def enable_warnings
-    remove_from_cflags "-w"
-  end
-
-  def m64
-    append_to_cflags "-m64"
-    append "LDFLAGS", "-arch #{Hardware::CPU.arch_64_bit}"
-  end
-
-  def m32
-    append_to_cflags "-m32"
-    append "LDFLAGS", "-arch #{Hardware::CPU.arch_32_bit}"
-  end
-
-  def universal_binary
-    check_for_compiler_universal_support
-
-    append_to_cflags Hardware::CPU.universal_archs.as_arch_flags
-    append "LDFLAGS", Hardware::CPU.universal_archs.as_arch_flags
-
-    return if compiler == :clang
-    return unless Hardware.is_32_bit?
-    # Can't mix "-march" for a 32-bit CPU  with "-arch x86_64"
-    replace_in_cflags(/-march=\S*/, "-Xarch_#{Hardware::CPU.arch_32_bit} \\0")
-  end
-
-  def cxx11
-    if compiler == :clang
-      append "CXX", "-std=c++11"
-      append "CXX", "-stdlib=libc++"
-    elsif gcc_with_cxx11_support?(compiler)
-      append "CXX", "-std=c++11"
-    else
-      raise "The selected compiler doesn't support C++11: #{compiler}"
+    map = Hardware::CPU.optimization_flags.dup
+    if DevelopmentTools.clang_build_version < 700
+      # Clang mistakenly enables AES-NI on plain Nehalem
+      map[:nehalem] = "-march=nehalem -Xclang -target-feature -Xclang -aes"
     end
+    set_cpu_cflags(map)
   end
 
+  sig { void }
+  def cxx11
+    append "CXX", "-std=c++11"
+    libcxx
+  end
+
+  sig { void }
   def libcxx
     append "CXX", "-stdlib=libc++" if compiler == :clang
   end
 
-  def libstdcxx
-    append "CXX", "-stdlib=libstdc++" if compiler == :clang
-  end
-
   # @private
+  sig { params(before: Regexp, after: String).void }
   def replace_in_cflags(before, after)
     CC_FLAG_VARS.each do |key|
-      self[key] = self[key].sub(before, after) if key?(key)
+      self[key] = fetch(key).sub(before, after) if key?(key)
     end
   end
 
   # Convenience method to set all C compiler flags in one shot.
+  sig { params(val: String).void }
   def define_cflags(val)
     CC_FLAG_VARS.each { |key| self[key] = val }
   end
@@ -212,48 +165,32 @@ module Stdenv
   # Sets architecture-specific flags for every environment variable
   # given in the list `flags`.
   # @private
-  def set_cpu_flags(flags, default = DEFAULT_FLAGS, map = Hardware::CPU.optimization_flags)
+  sig { params(flags: T::Array[String], map: T::Hash[Symbol, String]).void }
+  def set_cpu_flags(flags, map = Hardware::CPU.optimization_flags)
     cflags =~ /(-Xarch_#{Hardware::CPU.arch_32_bit} )-march=/
-    xarch = $1.to_s
+    xarch = Regexp.last_match(1).to_s
     remove flags, /(-Xarch_#{Hardware::CPU.arch_32_bit} )?-march=\S*/
     remove flags, /( -Xclang \S+)+/
     remove flags, /-mssse3/
     remove flags, /-msse4(\.\d)?/
     append flags, xarch unless xarch.empty?
-    append flags, map.fetch(effective_arch, default)
-  end
-  alias generic_set_cpu_flags set_cpu_flags
-
-  # @private
-  def effective_arch
-    if ARGV.build_bottle?
-      ARGV.bottle_arch || Hardware.oldest_cpu
-    elsif Hardware::CPU.intel? && !Hardware::CPU.sse4?
-      # If the CPU doesn't support SSE4, we cannot trust -march=native or
-      # -march=<cpu family> to do the right thing because we might be running
-      # in a VM or on a Hackintosh.
-      Hardware.oldest_cpu
-    else
-      Hardware::CPU.family
-    end
+    append flags, map.fetch(effective_arch)
   end
 
   # @private
-  def set_cpu_cflags(default = DEFAULT_FLAGS, map = Hardware::CPU.optimization_flags)
-    set_cpu_flags CC_FLAG_VARS, default, map
+  sig { params(map: T::Hash[Symbol, String]).void }
+  def set_cpu_cflags(map = Hardware::CPU.optimization_flags) # rubocop:disable Naming/AccessorMethodName
+    set_cpu_flags(CC_FLAG_VARS, map)
   end
 
+  sig { returns(Integer) }
   def make_jobs
-    # '-j' requires a positive integral argument
-    if self["HOMEBREW_MAKE_JOBS"].to_i > 0
-      self["HOMEBREW_MAKE_JOBS"].to_i
-    else
-      Hardware::CPU.cores
-    end
+    Homebrew::EnvConfig.make_jobs.to_i
   end
 
   # This method does nothing in stdenv since there's no arg refurbishment
   # @private
+  sig { void }
   def refurbish_args; end
 end
 

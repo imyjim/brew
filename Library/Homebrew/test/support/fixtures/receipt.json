@@ -1,4 +1,5 @@
 {
+  "homebrew_version": "1.1.6",
   "used_options": [
     "--with-foo",
     "--without-bar"
@@ -14,6 +15,7 @@
     "bin/foo"
   ],
   "time": 1403827774,
+  "source_modified_time": 1628303333,
   "HEAD": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
   "alias_path": "/usr/local/Library/Taps/homebrew/homebrew-core/Aliases/test-formula",
   "stdlib": "libcxx",
@@ -25,12 +27,11 @@
     }
   ],
   "source": {
-      "path": "/usr/local/Library/Taps/hombrew/homebrew-core/Formula/foo.rb",
+      "path": "/usr/local/Library/Taps/homebrew/homebrew-core/Formula/foo.rb",
       "tap": "homebrew/core",
       "spec": "stable",
       "versions": {
         "stable": "2.14",
-        "devel": "2.15",
         "head": "HEAD-0000000"
       }
   }

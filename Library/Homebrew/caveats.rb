@@ -1,4 +1,14 @@
+# typed: false
+# frozen_string_literal: true
+
+require "language/python"
+
+# A formula's caveats.
+#
+# @api private
 class Caveats
+  extend Forwardable
+
   attr_reader :f
 
   def initialize(f)
@@ -11,172 +21,123 @@ class Caveats
       build = f.build
       f.build = Tab.for_formula(f)
       s = f.caveats.to_s
-      caveats << s.chomp + "\n" unless s.empty?
+      caveats << "#{s.chomp}\n" unless s.empty?
     ensure
       f.build = build
     end
     caveats << keg_only_text
-    caveats << bash_completion_caveats
-    caveats << zsh_completion_caveats
-    caveats << fish_completion_caveats
-    caveats << zsh_function_caveats
-    caveats << fish_function_caveats
-    caveats << plist_caveats
-    caveats << python_caveats
-    caveats << app_caveats
+
+    valid_shells = [:bash, :zsh, :fish].freeze
+    current_shell = Utils::Shell.preferred || Utils::Shell.parent
+    shells = if current_shell.present? &&
+                (shell_sym = current_shell.to_sym) &&
+                valid_shells.include?(shell_sym)
+      [shell_sym]
+    else
+      valid_shells
+    end
+    shells.each do |shell|
+      caveats << function_completion_caveats(shell)
+    end
+
+    caveats << service_caveats
     caveats << elisp_caveats
     caveats.compact.join("\n")
   end
 
-  def empty?
-    caveats.empty?
+  delegate [:empty?, :to_s] => :caveats
+
+  def keg_only_text(skip_reason: false)
+    return unless f.keg_only?
+
+    s = if skip_reason
+      ""
+    else
+      <<~EOS
+        #{f.name} is keg-only, which means it was not symlinked into #{HOMEBREW_PREFIX},
+        because #{f.keg_only_reason.to_s.chomp}.
+      EOS
+    end.dup
+
+    if f.bin.directory? || f.sbin.directory?
+      s << <<~EOS
+
+        If you need to have #{f.name} first in your PATH, run:
+      EOS
+      s << "  #{Utils::Shell.prepend_path_in_profile(f.opt_bin.to_s)}\n" if f.bin.directory?
+      s << "  #{Utils::Shell.prepend_path_in_profile(f.opt_sbin.to_s)}\n" if f.sbin.directory?
+    end
+
+    if f.lib.directory? || f.include.directory?
+      s << <<~EOS
+
+        For compilers to find #{f.name} you may need to set:
+      EOS
+
+      s << "  #{Utils::Shell.export_value("LDFLAGS", "-L#{f.opt_lib}")}\n" if f.lib.directory?
+
+      s << "  #{Utils::Shell.export_value("CPPFLAGS", "-I#{f.opt_include}")}\n" if f.include.directory?
+
+      if which("pkg-config", ORIGINAL_PATHS) &&
+         ((f.lib/"pkgconfig").directory? || (f.share/"pkgconfig").directory?)
+        s << <<~EOS
+
+          For pkg-config to find #{f.name} you may need to set:
+        EOS
+
+        if (f.lib/"pkgconfig").directory?
+          s << "  #{Utils::Shell.export_value("PKG_CONFIG_PATH", "#{f.opt_lib}/pkgconfig")}\n"
+        end
+
+        if (f.share/"pkgconfig").directory?
+          s << "  #{Utils::Shell.export_value("PKG_CONFIG_PATH", "#{f.opt_share}/pkgconfig")}\n"
+        end
+      end
+    end
+    s << "\n"
   end
 
   private
 
   def keg
     @keg ||= [f.prefix, f.opt_prefix, f.linked_keg].map do |d|
-      begin
-        Keg.new(d.resolved_path)
-      rescue
-        nil
-      end
+      Keg.new(d.resolved_path)
+    rescue
+      nil
     end.compact.first
   end
 
-  def keg_only_text
-    return unless f.keg_only?
-
-    s = "This formula is keg-only, which means it was not symlinked into #{HOMEBREW_PREFIX}."
-    s << "\n\n#{f.keg_only_reason}"
-    if f.lib.directory? || f.include.directory?
-      s <<
-        <<-EOS.undent_________________________________________________________72
-
-
-        Generally there are no consequences of this for you. If you build your
-        own software and it requires this formula, you'll need to add to your
-        build variables:
-
-        EOS
-      s << "    LDFLAGS:  -L#{f.opt_lib}\n" if f.lib.directory?
-      s << "    CPPFLAGS: -I#{f.opt_include}\n" if f.include.directory?
-
-      if which("pkg-config")
-        s << "    PKG_CONFIG_PATH: #{f.opt_lib}/pkgconfig\n" if (f.lib/"pkgconfig").directory?
-        s << "    PKG_CONFIG_PATH: #{f.opt_share}/pkgconfig\n" if (f.share/"pkgconfig").directory?
-      end
-    end
-    s << "\n"
-  end
-
-  def bash_completion_caveats
+  def function_completion_caveats(shell)
     return unless keg
-    return unless keg.completion_installed?(:bash)
+    return unless which(shell.to_s, ORIGINAL_PATHS)
 
-    <<-EOS.undent
-      Bash completion has been installed to:
-        #{HOMEBREW_PREFIX}/etc/bash_completion.d
-    EOS
-  end
+    completion_installed = keg.completion_installed?(shell)
+    functions_installed = keg.functions_installed?(shell)
+    return if !completion_installed && !functions_installed
 
-  def zsh_completion_caveats
-    return unless keg
-    return unless keg.completion_installed?(:zsh)
+    installed = []
+    installed << "completions" if completion_installed
+    installed << "functions" if functions_installed
 
-    <<-EOS.undent
-      zsh completion has been installed to:
-        #{HOMEBREW_PREFIX}/share/zsh/site-functions
-    EOS
-  end
+    root_dir = f.keg_only? ? f.opt_prefix : HOMEBREW_PREFIX
 
-  def fish_completion_caveats
-    return unless keg
-    return unless keg.completion_installed?(:fish)
-    return unless which("fish")
-
-    <<-EOS.undent
-      fish completion has been installed to:
-        #{HOMEBREW_PREFIX}/share/fish/vendor_completions.d
-    EOS
-  end
-
-  def zsh_function_caveats
-    return unless keg
-    return unless keg.zsh_functions_installed?
-
-    <<-EOS.undent
-      zsh functions have been installed to:
-        #{HOMEBREW_PREFIX}/share/zsh/site-functions
-    EOS
-  end
-
-  def fish_function_caveats
-    return unless keg
-    return unless keg.fish_functions_installed?
-    return unless which("fish")
-
-    <<-EOS.undent
-      fish functions have been installed to:
-        #{HOMEBREW_PREFIX}/share/fish/vendor_functions.d
-    EOS
-  end
-
-  def python_caveats
-    return unless keg
-    return unless keg.python_site_packages_installed?
-
-    s = nil
-    homebrew_site_packages = Language::Python.homebrew_site_packages
-    user_site_packages = Language::Python.user_site_packages "python"
-    pth_file = user_site_packages/"homebrew.pth"
-    instructions = <<-EOS.undent.gsub(/^/, "  ")
-      mkdir -p #{user_site_packages}
-      echo 'import site; site.addsitedir("#{homebrew_site_packages}")' >> #{pth_file}
-    EOS
-
-    if f.keg_only?
-      keg_site_packages = f.opt_prefix/"lib/python2.7/site-packages"
-      unless Language::Python.in_sys_path?("python", keg_site_packages)
-        s = <<-EOS.undent
-          If you need Python to find bindings for this keg-only formula, run:
-            echo #{keg_site_packages} >> #{homebrew_site_packages/f.name}.pth
-        EOS
-        s += instructions unless Language::Python.reads_brewed_pth_files?("python")
-      end
-      return s
-    end
-
-    return if Language::Python.reads_brewed_pth_files?("python")
-
-    if !Language::Python.in_sys_path?("python", homebrew_site_packages)
-      s = <<-EOS.undent
-        Python modules have been installed and Homebrew's site-packages is not
-        in your Python sys.path, so you will not be able to import the modules
-        this formula installed. If you plan to develop with these modules,
-        please run:
+    case shell
+    when :bash
+      <<~EOS
+        Bash completion has been installed to:
+          #{root_dir}/etc/bash_completion.d
       EOS
-      s += instructions
-    elsif keg.python_pth_files_installed?
-      s = <<-EOS.undent
-        This formula installed .pth files to Homebrew's site-packages and your
-        Python isn't configured to process them, so you will not be able to
-        import the modules this formula installed. If you plan to develop
-        with these modules, please run:
+    when :zsh
+      <<~EOS
+        zsh #{installed.join(" and ")} have been installed to:
+          #{root_dir}/share/zsh/site-functions
       EOS
-      s += instructions
+    when :fish
+      fish_caveats = +"fish #{installed.join(" and ")} have been installed to:"
+      fish_caveats << "\n  #{root_dir}/share/fish/vendor_completions.d" if completion_installed
+      fish_caveats << "\n  #{root_dir}/share/fish/vendor_functions.d" if functions_installed
+      fish_caveats.freeze
     end
-    s
-  end
-
-  def app_caveats
-    return unless keg
-    return unless keg.app_installed?
-
-    <<-EOS.undent
-      .app bundles were installed.
-      Run `brew linkapps #{keg.name}` to symlink these to /Applications.
-    EOS
   end
 
   def elisp_caveats
@@ -184,64 +145,59 @@ class Caveats
     return unless keg
     return unless keg.elisp_installed?
 
-    <<-EOS.undent
+    <<~EOS
       Emacs Lisp files have been installed to:
         #{HOMEBREW_PREFIX}/share/emacs/site-lisp/#{f.name}
     EOS
   end
 
-  def plist_caveats
+  def service_caveats
+    return if !f.plist && !f.service? && !keg&.plist_installed?
+
     s = []
-    if f.plist || (keg && keg.plist_installed?)
-      destination = if f.plist_startup
-        "/Library/LaunchDaemons"
-      else
-        "~/Library/LaunchAgents"
-      end
 
-      plist_filename = if f.plist
-        f.plist_path.basename
-      else
-        File.basename Dir["#{keg}/*.plist"].first
-      end
-      plist_domain = f.plist_path.basename(".plist")
-      destination_path = Pathname.new File.expand_path destination
-      plist_path = destination_path/plist_filename
-
-      # we readlink because this path probably doesn't exist since caveats
-      # occurs before the link step of installation
-      # Yosemite security measures mildly tighter rules:
-      # https://github.com/Homebrew/legacy-homebrew/issues/33815
-      if !plist_path.file? || !plist_path.symlink?
-        if f.plist_startup
-          s << "To have launchd start #{f.full_name} now and restart at startup:"
-          s << "  sudo brew services start #{f.full_name}"
-        else
-          s << "To have launchd start #{f.full_name} now and restart at login:"
-          s << "  brew services start #{f.full_name}"
-        end
-      # For startup plists, we cannot tell whether it's running on launchd,
-      # as it requires for `sudo launchctl list` to get real result.
-      elsif f.plist_startup
-        s << "To restart #{f.full_name} after an upgrade:"
-        s << "  sudo brew services restart #{f.full_name}"
-      elsif Kernel.system "/bin/launchctl list #{plist_domain} &>/dev/null"
-        s << "To restart #{f.full_name} after an upgrade:"
-        s << "  brew services restart #{f.full_name}"
-      else
-        s << "To start #{f.full_name}:"
-        s << "  brew services start #{f.full_name}"
-      end
-
-      if f.plist_manual
-        s << "Or, if you don't want/need a background service you can just run:"
-        s << "  #{f.plist_manual}"
-      end
-
-      if ENV["TMUX"] && !quiet_system("/usr/bin/pbpaste")
-        s << "" << "WARNING: brew services will fail when run under tmux."
-      end
+    command = if f.service?
+      f.service.manual_command
+    else
+      f.plist_manual
     end
-    s.join("\n") + "\n" unless s.empty?
+
+    return <<~EOS if !which("launchctl") && f.plist
+      #{Formatter.warning("Warning:")} #{f.name} provides a launchd plist which can only be used on macOS!
+      You can manually execute the service instead with:
+        #{command}
+    EOS
+
+    # Brew services only works with these two tools
+    return <<~EOS if !which("systemctl") && !which("launchctl") && f.service?
+      #{Formatter.warning("Warning:")} #{f.name} provides a service which can only be used on macOS or systemd!
+      You can manually execute the service instead with:
+        #{command}
+    EOS
+
+    is_running_service = f.service? && quiet_system("ps aux | grep #{f.service.command&.first}")
+    if is_running_service || (f.plist && quiet_system("/bin/launchctl list #{f.plist_name} &>/dev/null"))
+      s << "To restart #{f.full_name} after an upgrade:"
+      s << "  #{f.plist_startup ? "sudo " : ""}brew services restart #{f.full_name}"
+    elsif f.plist_startup
+      s << "To start #{f.full_name} now and restart at startup:"
+      s << "  sudo brew services start #{f.full_name}"
+    else
+      s << "To start #{f.full_name} now and restart at login:"
+      s << "  brew services start #{f.full_name}"
+    end
+
+    if f.plist_manual || f.service?
+      s << "Or, if you don't want/need a background service you can just run:"
+      s << "  #{command}"
+    end
+
+    # pbpaste is the system clipboard tool on macOS and fails with `tmux` by default
+    # check if this is being run under `tmux` to avoid failing
+    if ENV["HOMEBREW_TMUX"] && !quiet_system("/usr/bin/pbpaste")
+      s << "" << "WARNING: brew services will fail when run under tmux."
+    end
+
+    "#{s.join("\n")}\n" unless s.empty?
   end
 end

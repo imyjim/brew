@@ -1,111 +1,161 @@
-require "hardware"
-require "development_tools"
+# typed: false
+# frozen_string_literal: true
+
 require "os/mac/version"
 require "os/mac/xcode"
-require "os/mac/xquartz"
-require "os/mac/pathname"
 require "os/mac/sdk"
 require "os/mac/keg"
 
 module OS
+  # Helper module for querying system information on macOS.
   module Mac
+    extend T::Sig
+
     module_function
 
-    ::MacOS = self # rubocop:disable Style/ConstantName
+    ::MacOS = OS::Mac
 
     raise "Loaded OS::Mac on generic OS!" if ENV["HOMEBREW_TEST_GENERIC_OS"]
 
+    VERSION = ENV.fetch("HOMEBREW_MACOS_VERSION").chomp.freeze
+    private_constant :VERSION
+
     # This can be compared to numerics, strings, or symbols
     # using the standard Ruby Comparable methods.
+    sig { returns(Version) }
     def version
-      @version ||= Version.new(full_version.to_s[/10\.\d+/])
+      @version ||= full_version.strip_patch
     end
 
     # This can be compared to numerics, strings, or symbols
     # using the standard Ruby Comparable methods.
+    sig { returns(Version) }
     def full_version
-      @full_version ||= Version.new((ENV["HOMEBREW_MACOS_VERSION"] || ENV["HOMEBREW_OSX_VERSION"]).chomp)
+      @full_version ||= if ENV["HOMEBREW_FAKE_EL_CAPITAN"] # for Portable Ruby building
+        Version.new("10.11.6")
+      else
+        Version.new(VERSION)
+      end
     end
 
-    def prerelease?
-      # TODO: bump version when new OS is released
-      version >= "10.13"
+    sig { params(version: Version).void }
+    def full_version=(version)
+      @full_version = Version.new(version.chomp)
+      @version = nil
     end
 
-    def outdated_release?
-      # TODO: bump version when new OS is released
-      version < "10.10"
+    sig { returns(::Version) }
+    def latest_sdk_version
+      # TODO: bump version when new Xcode macOS SDK is released
+      # NOTE: We only track the major version of the SDK.
+      ::Version.new("12")
     end
+    private :latest_sdk_version
 
-    def cat
-      version.to_sym
+    sig { returns(String) }
+    def preferred_perl_version
+      if version >= :big_sur
+        "5.30"
+      else
+        "5.18"
+      end
     end
 
     def languages
-      return @languages unless @languages.nil?
+      return @languages if @languages
 
-      @languages = Utils.popen_read("defaults", "read", ".GlobalPreferences", "AppleLanguages").scan(/[^ \n"(),]+/)
-
-      if ENV["HOMEBREW_LANGUAGES"]
-        @languages = ENV["HOMEBREW_LANGUAGES"].split(",") + @languages
+      os_langs = Utils.popen_read("defaults", "read", "-g", "AppleLanguages")
+      if os_langs.blank?
+        # User settings don't exist so check the system-wide one.
+        os_langs = Utils.popen_read("defaults", "read", "/Library/Preferences/.GlobalPreferences", "AppleLanguages")
       end
+      os_langs = os_langs.scan(/[^ \n"(),]+/)
 
-      if ARGV.value("language")
-        @languages = ARGV.value("language").split(",") + @languages
-      end
-
-      @languages = @languages.uniq
+      @languages = os_langs
     end
 
     def language
       languages.first
     end
 
+    sig { returns(String) }
     def active_developer_dir
       @active_developer_dir ||= Utils.popen_read("/usr/bin/xcode-select", "-print-path").strip
     end
 
-    # If a specific SDK is requested
-    #   a) The requested SDK is returned, if it's installed.
-    #   b) If the requested SDK is not installed, the newest SDK (if any SDKs
-    #      are available) is returned.
-    #   c) If no SDKs are available, nil is returned.
-    # If no specific SDK is requested
-    #   a) For Xcode >= 7, the latest SDK is returned even if the latest SDK is
-    #      named after a newer OS version than the running OS. The
-    #      MACOSX_DEPLOYMENT_TARGET must be set to the OS for which you're
-    #      actually building (usually the running OS version).
-    #      https://github.com/Homebrew/legacy-homebrew/pull/50355
-    #      https://developer.apple.com/library/ios/documentation/DeveloperTools/Conceptual/WhatsNewXcode/Articles/Introduction.html#//apple_ref/doc/uid/TP40004626
-    #      Section "About SDKs and Simulator"
-    #   b) For Xcode < 7, proceed as if the SDK for the running OS version had
-    #      specifically been requested according to the rules above.
-
-    def sdk(v = nil)
-      @locator ||= SDKLocator.new
-      begin
-        sdk = if v.nil?
-          Xcode.version.to_i >= 7 ? @locator.latest_sdk : @locator.sdk_for(version)
-        else
-          @locator.sdk_for v
-        end
-      rescue SDKLocator::NoSDKError
-        sdk = @locator.latest_sdk
+    sig { returns(T::Boolean) }
+    def sdk_root_needed?
+      if MacOS::CLT.installed?
+        # If there's no CLT SDK, return false
+        return false unless MacOS::CLT.provides_sdk?
+        # If the CLT is installed and headers are provided by the system, return false
+        return false unless MacOS::CLT.separate_header_package?
       end
-      # Only return an SDK older than the OS version if it was specifically requested
-      sdk if v || (!sdk.nil? && sdk.version >= version)
+
+      true
     end
 
-    # Returns the path to an SDK or nil, following the rules set by #sdk.
+    # If a specific SDK is requested:
+    #
+    #   1. The requested SDK is returned, if it's installed.
+    #   2. If the requested SDK is not installed, the newest SDK (if any SDKs
+    #      are available) is returned.
+    #   3. If no SDKs are available, nil is returned.
+    #
+    # If no specific SDK is requested, the SDK matching the OS version is returned,
+    # if available. Otherwise, the latest SDK is returned.
+
+    def sdk_locator
+      if CLT.installed? && CLT.provides_sdk?
+        CLT.sdk_locator
+      else
+        Xcode.sdk_locator
+      end
+    end
+
+    def sdk(v = nil)
+      sdk_locator.sdk_if_applicable(v)
+    end
+
+    def sdk_for_formula(f, v = nil, check_only_runtime_requirements: false)
+      # If the formula requires Xcode, don't return the CLT SDK
+      # If check_only_runtime_requirements is true, don't necessarily return the
+      # Xcode SDK if the XcodeRequirement is only a build or test requirement.
+      return Xcode.sdk if f.requirements.any? do |req|
+        next false unless req.is_a? XcodeRequirement
+        next false if check_only_runtime_requirements && req.build? && !req.test?
+
+        true
+      end
+
+      sdk(v)
+    end
+
+    # Returns the path to an SDK or nil, following the rules set by {sdk}.
     def sdk_path(v = nil)
       s = sdk(v)
-      s.path unless s.nil?
+      s&.path
+    end
+
+    def sdk_path_if_needed(v = nil)
+      # Prefer CLT SDK when both Xcode and the CLT are installed.
+      # Expected results:
+      # 1. On Xcode-only systems, return the Xcode SDK.
+      # 2. On Xcode-and-CLT systems where headers are provided by the system, return nil.
+      # 3. On CLT-only systems with no CLT SDK, return nil.
+      # 4. On CLT-only systems with a CLT SDK, where headers are provided by the system, return nil.
+      # 5. On CLT-only systems with a CLT SDK, where headers are not provided by the system, return the CLT SDK.
+
+      return unless sdk_root_needed?
+
+      sdk_path(v)
     end
 
     # See these issues for some history:
-    # https://github.com/Homebrew/legacy-homebrew/issues/13
-    # https://github.com/Homebrew/legacy-homebrew/issues/41
-    # https://github.com/Homebrew/legacy-homebrew/issues/48
+    #
+    # - {https://github.com/Homebrew/legacy-homebrew/issues/13}
+    # - {https://github.com/Homebrew/legacy-homebrew/issues/41}
+    # - {https://github.com/Homebrew/legacy-homebrew/issues/48}
     def macports_or_fink
       paths = []
 
@@ -124,8 +174,8 @@ module OS
         paths << path if path.exist?
       end
 
-      # Finally, some users make their MacPorts or Fink directorie
-      # read-only in order to try out Homebrew, but this doens't work as
+      # Finally, some users make their MacPorts or Fink directories
+      # read-only in order to try out Homebrew, but this doesn't work as
       # some build scripts error out when trying to read from these now
       # unreadable paths.
       %w[/sw /opt/local].map { |p| Pathname.new(p) }.each do |path|
@@ -135,93 +185,16 @@ module OS
       paths.uniq
     end
 
-    def prefer_64_bit?
-      if ENV["HOMEBREW_PREFER_64_BIT"] && version == :leopard
-        Hardware::CPU.is_64_bit?
-      else
-        Hardware::CPU.is_64_bit? && version > :leopard
-      end
-    end
-
-    def preferred_arch
-      if prefer_64_bit?
-        Hardware::CPU.arch_64_bit
-      else
-        Hardware::CPU.arch_32_bit
-      end
-    end
-
-    STANDARD_COMPILERS = {
-      "2.0"   => { gcc_40_build: 4061 },
-      "2.5"   => { gcc_40_build: 5370 },
-      "3.1.4" => { gcc_40_build: 5493, gcc_42_build: 5577 },
-      "3.2.6" => { gcc_40_build: 5494, gcc_42_build: 5666, clang: "1.7", clang_build: 77 },
-      "4.0"   => { gcc_40_build: 5494, gcc_42_build: 5666, clang: "2.0", clang_build: 137 },
-      "4.0.1" => { gcc_40_build: 5494, gcc_42_build: 5666, clang: "2.0", clang_build: 137 },
-      "4.0.2" => { gcc_40_build: 5494, gcc_42_build: 5666, clang: "2.0", clang_build: 137 },
-      "4.2"   => { clang: "3.0", clang_build: 211 },
-      "4.3"   => { clang: "3.1", clang_build: 318 },
-      "4.3.1" => { clang: "3.1", clang_build: 318 },
-      "4.3.2" => { clang: "3.1", clang_build: 318 },
-      "4.3.3" => { clang: "3.1", clang_build: 318 },
-      "4.4"   => { clang: "4.0", clang_build: 421 },
-      "4.4.1" => { clang: "4.0", clang_build: 421 },
-      "4.5"   => { clang: "4.1", clang_build: 421 },
-      "4.5.1" => { clang: "4.1", clang_build: 421 },
-      "4.5.2" => { clang: "4.1", clang_build: 421 },
-      "4.6"   => { clang: "4.2", clang_build: 425 },
-      "4.6.1" => { clang: "4.2", clang_build: 425 },
-      "4.6.2" => { clang: "4.2", clang_build: 425 },
-      "4.6.3" => { clang: "4.2", clang_build: 425 },
-      "5.0"   => { clang: "5.0", clang_build: 500 },
-      "5.0.1" => { clang: "5.0", clang_build: 500 },
-      "5.0.2" => { clang: "5.0", clang_build: 500 },
-      "5.1"   => { clang: "5.1", clang_build: 503 },
-      "5.1.1" => { clang: "5.1", clang_build: 503 },
-      "6.0"   => { clang: "6.0", clang_build: 600 },
-      "6.0.1" => { clang: "6.0", clang_build: 600 },
-      "6.1"   => { clang: "6.0", clang_build: 600 },
-      "6.1.1" => { clang: "6.0", clang_build: 600 },
-      "6.2"   => { clang: "6.0", clang_build: 600 },
-      "6.3"   => { clang: "6.1", clang_build: 602 },
-      "6.3.1" => { clang: "6.1", clang_build: 602 },
-      "6.3.2" => { clang: "6.1", clang_build: 602 },
-      "6.4"   => { clang: "6.1", clang_build: 602 },
-      "7.0"   => { clang: "7.0", clang_build: 700 },
-      "7.0.1" => { clang: "7.0", clang_build: 700 },
-      "7.1"   => { clang: "7.0", clang_build: 700 },
-      "7.1.1" => { clang: "7.0", clang_build: 700 },
-      "7.2"   => { clang: "7.0", clang_build: 700 },
-      "7.2.1" => { clang: "7.0", clang_build: 700 },
-      "7.3"   => { clang: "7.3", clang_build: 703 },
-      "7.3.1" => { clang: "7.3", clang_build: 703 },
-      "8.0"   => { clang: "8.0", clang_build: 800 },
-    }.freeze
-
-    def compilers_standard?
-      STANDARD_COMPILERS.fetch(Xcode.version.to_s).all? do |method, build|
-        send(:"#{method}_version") == build
-      end
-    rescue IndexError
-      onoe <<-EOS.undent
-        Homebrew doesn't know what compiler versions ship with your version
-        of Xcode (#{Xcode.version}). Please `brew update` and if that doesn't
-        help, file an issue with the output of `brew --config`:
-          https://github.com/Homebrew/brew/issues
-
-        Note that we only track stable, released versions of Xcode.
-
-        Thanks!
-      EOS
-    end
-
+    sig { params(ids: String).returns(T.nilable(Pathname)) }
     def app_with_bundle_id(*ids)
-      path = mdfind(*ids).first
-      Pathname.new(path) unless path.nil? || path.empty?
+      path = mdfind(*ids)
+             .reject { |p| p.include?("/Backups.backupdb/") }
+             .first
+      Pathname.new(path) if path.present?
     end
 
+    sig { params(ids: String).returns(T::Array[String]) }
     def mdfind(*ids)
-      return [] unless OS.mac?
       (@mdfind ||= {}).fetch(ids) do
         @mdfind[ids] = Utils.popen_read("/usr/bin/mdfind", mdfind_query(*ids)).split("\n")
       end
@@ -233,6 +206,7 @@ module OS
       end
     end
 
+    sig { params(ids: String).returns(String) }
     def mdfind_query(*ids)
       ids.map! { |id| "kMDItemCFBundleIdentifier == #{id}" }.join(" || ")
     end

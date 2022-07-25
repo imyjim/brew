@@ -1,142 +1,231 @@
-#:  * `upgrade` [<install-options>] [`--cleanup`] [`--fetch-HEAD`] [<formulae>]:
-#:    Upgrade outdated, unpinned brews.
-#:
-#:    Options for the `install` command are also valid here.
-#:
-#:    If `--cleanup` is specified then remove previously installed <formula> version(s).
-#:
-#:    If `--fetch-HEAD` is passed, fetch the upstream repository to detect if
-#:    the HEAD installation of the formula is outdated. Otherwise, the
-#:    repository's HEAD will be checked for updates when a new stable or devel
-#:    version has been released.
-#:
-#:    If <formulae> are given, upgrade only the specified brews (but do so even
-#:    if they are pinned; see `pin`, `unpin`).
+# typed: false
+# frozen_string_literal: true
 
-require "cmd/install"
-require "cleanup"
-require "development_tools"
+require "cli/parser"
+require "formula_installer"
+require "install"
+require "upgrade"
+require "cask/cmd"
+require "cask/utils"
+require "cask/macos"
+require "api"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
-  def upgrade
-    FormulaInstaller.prevent_build_flags unless DevelopmentTools.installed?
+  sig { returns(CLI::Parser) }
+  def upgrade_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Upgrade outdated casks and outdated, unpinned formulae using the same options they were originally
+        installed with, plus any appended brew formula options. If <cask> or <formula> are specified,
+        upgrade only the given <cask> or <formula> kegs (unless they are pinned; see `pin`, `unpin`).
 
-    Homebrew.perform_preinstall_checks
+        Unless `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` is set, `brew upgrade` or `brew reinstall` will be run for
+        outdated dependents and dependents with broken linkage, respectively.
 
-    if ARGV.include?("--all")
-      opoo <<-EOS.undent
-        We decided to not change the behaviour of `brew upgrade` so
-        `brew upgrade --all` is equivalent to `brew upgrade` without any other
-        arguments (so the `--all` is a no-op and can be removed).
+        Unless `HOMEBREW_NO_INSTALL_CLEANUP` is set, `brew cleanup` will then be run for the
+        upgraded formulae or, every 30 days, for all formulae.
       EOS
+      switch "-d", "--debug",
+             description: "If brewing fails, open an interactive debugging session with access to IRB " \
+                          "or a shell inside the temporary build directory."
+      switch "-f", "--force",
+             description: "Install formulae without checking for previously installed keg-only or " \
+                          "non-migrated versions. When installing casks, overwrite existing files " \
+                          "(binaries and symlinks are excluded, unless originally from the same cask)."
+      switch "-v", "--verbose",
+             description: "Print the verification and postinstall steps."
+      switch "-n", "--dry-run",
+             description: "Show what would be upgraded, but do not actually upgrade anything."
+      [
+        [:switch, "--formula", "--formulae", {
+          description: "Treat all named arguments as formulae. If no named arguments " \
+                       "are specified, upgrade only outdated formulae.",
+        }],
+        [:switch, "-s", "--build-from-source", {
+          description: "Compile <formula> from source even if a bottle is available.",
+        }],
+        [:switch, "-i", "--interactive", {
+          description: "Download and patch <formula>, then open a shell. This allows the user to " \
+                       "run `./configure --help` and otherwise determine how to turn the software " \
+                       "package into a Homebrew package.",
+        }],
+        [:switch, "--force-bottle", {
+          description: "Install from a bottle if it exists for the current or newest version of " \
+                       "macOS, even if it would not normally be used for installation.",
+        }],
+        [:switch, "--fetch-HEAD", {
+          description: "Fetch the upstream repository to detect if the HEAD installation of the " \
+                       "formula is outdated. Otherwise, the repository's HEAD will only be checked for " \
+                       "updates when a new stable or development version has been released.",
+        }],
+        [:switch, "--ignore-pinned", {
+          description: "Set a successful exit status even if pinned formulae are not upgraded.",
+        }],
+        [:switch, "--keep-tmp", {
+          description: "Retain the temporary files created during installation.",
+        }],
+        [:switch, "--display-times", {
+          env:         :display_install_times,
+          description: "Print install times for each package at the end of the run.",
+        }],
+      ].each do |options|
+        send(*options)
+        conflicts "--cask", options[-2]
+      end
+      formula_options
+      [
+        [:switch, "--cask", "--casks", {
+          description: "Treat all named arguments as casks. If no named arguments " \
+                       "are specified, upgrade only outdated casks.",
+        }],
+        *Cask::Cmd::AbstractCommand::OPTIONS,
+        *Cask::Cmd::Upgrade::OPTIONS,
+      ].each do |options|
+        send(*options)
+        conflicts "--formula", options[-2]
+      end
+      cask_options
+
+      conflicts "--build-from-source", "--force-bottle"
+
+      named_args [:outdated_formula, :outdated_cask]
+    end
+  end
+
+  sig { void }
+  def upgrade
+    args = upgrade_args.parse
+
+    formulae, casks = args.named.to_resolved_formulae_to_casks
+    # If one or more formulae are specified, but no casks were
+    # specified, we want to make note of that so we don't
+    # try to upgrade all outdated casks.
+    only_upgrade_formulae = formulae.present? && casks.blank?
+    only_upgrade_casks = casks.present? && formulae.blank?
+
+    upgrade_outdated_formulae(formulae, args: args) unless only_upgrade_casks
+    upgrade_outdated_casks(casks, args: args) unless only_upgrade_formulae
+
+    Homebrew.messages.display_messages(display_times: args.display_times?)
+  end
+
+  sig { params(formulae: T::Array[Formula], args: CLI::Args).returns(T::Boolean) }
+  def upgrade_outdated_formulae(formulae, args:)
+    return false if args.cask?
+
+    if args.build_from_source? && !DevelopmentTools.installed?
+      raise BuildFlagsError.new(["--build-from-source"], bottled: formulae.all?(&:bottled?))
     end
 
-    if ARGV.named.empty?
+    Install.perform_preinstall_checks
+
+    if formulae.blank?
       outdated = Formula.installed.select do |f|
-        f.outdated?(fetch_head: ARGV.fetch_head?)
+        f.outdated?(fetch_head: args.fetch_HEAD?)
       end
-
-      exit 0 if outdated.empty?
     else
-      outdated = ARGV.resolved_formulae.select do |f|
-        f.outdated?(fetch_head: ARGV.fetch_head?)
+      outdated, not_outdated = formulae.partition do |f|
+        f.outdated?(fetch_head: args.fetch_HEAD?)
       end
 
-      (ARGV.resolved_formulae - outdated).each do |f|
+      not_outdated.each do |f|
         versions = f.installed_kegs.map(&:version)
         if versions.empty?
-          onoe "#{f.full_specified_name} not installed"
+          ofail "#{f.full_specified_name} not installed"
         else
           version = versions.max
-          onoe "#{f.full_specified_name} #{version} already installed"
+          opoo "#{f.full_specified_name} #{version} already installed"
         end
       end
-      exit 1 if outdated.empty?
     end
 
-    unless upgrade_pinned?
-      pinned = outdated.select(&:pinned?)
-      outdated -= pinned
+    return false if outdated.blank?
+
+    pinned = outdated.select(&:pinned?)
+    outdated -= pinned
+    formulae_to_install = outdated.map do |f|
+      f_latest = f.latest_formula
+      if f_latest.latest_version_installed?
+        f
+      else
+        f_latest
+      end
     end
 
-    formulae_to_install = outdated.map(&:latest_formula)
+    if !pinned.empty? && !args.ignore_pinned?
+      ofail "Not upgrading #{pinned.count} pinned #{"package".pluralize(pinned.count)}:"
+      puts pinned.map { |f| "#{f.full_specified_name} #{f.pkg_version}" } * ", "
+    end
 
     if formulae_to_install.empty?
       oh1 "No packages to upgrade"
     else
-      oh1 "Upgrading #{formulae_to_install.length} outdated package#{plural(formulae_to_install.length)}, with result:"
-      puts formulae_to_install.map { |f| "#{f.full_specified_name} #{f.pkg_version}" } * ", "
+      verb = args.dry_run? ? "Would upgrade" : "Upgrading"
+      oh1 "#{verb} #{formulae_to_install.count} outdated #{"package".pluralize(formulae_to_install.count)}:"
+      formulae_upgrades = formulae_to_install.map do |f|
+        if f.optlinked?
+          "#{f.full_specified_name} #{Keg.new(f.opt_prefix).version} -> #{f.pkg_version}"
+        else
+          "#{f.full_specified_name} #{f.pkg_version}"
+        end
+      end
+      puts formulae_upgrades.join("\n")
     end
 
-    unless upgrade_pinned? || pinned.empty?
-      oh1 "Not upgrading #{pinned.length} pinned package#{plural(pinned.length)}:"
-      puts pinned.map { |f| "#{f.full_specified_name} #{f.pkg_version}" } * ", "
-    end
+    Upgrade.upgrade_formulae(
+      formulae_to_install,
+      flags:                      args.flags_only,
+      dry_run:                    args.dry_run?,
+      installed_on_request:       args.named.present?,
+      force_bottle:               args.force_bottle?,
+      build_from_source_formulae: args.build_from_source_formulae,
+      interactive:                args.interactive?,
+      keep_tmp:                   args.keep_tmp?,
+      force:                      args.force?,
+      debug:                      args.debug?,
+      quiet:                      args.quiet?,
+      verbose:                    args.verbose?,
+    )
 
-    formulae_to_install.each do |f|
-      upgrade_formula(f)
-      next unless ARGV.include?("--cleanup")
-      next unless f.installed?
-      Homebrew::Cleanup.cleanup_formula f
-    end
+    Upgrade.check_installed_dependents(
+      formulae_to_install,
+      flags:                      args.flags_only,
+      dry_run:                    args.dry_run?,
+      installed_on_request:       args.named.present?,
+      force_bottle:               args.force_bottle?,
+      build_from_source_formulae: args.build_from_source_formulae,
+      interactive:                args.interactive?,
+      keep_tmp:                   args.keep_tmp?,
+      force:                      args.force?,
+      debug:                      args.debug?,
+      quiet:                      args.quiet?,
+      verbose:                    args.verbose?,
+    )
+
+    true
   end
 
-  def upgrade_pinned?
-    !ARGV.named.empty?
-  end
+  sig { params(casks: T::Array[Cask::Cask], args: CLI::Args).returns(T::Boolean) }
+  def upgrade_outdated_casks(casks, args:)
+    return false if args.formula?
 
-  def upgrade_formula(f)
-    formulae_maybe_with_kegs = [f] + f.old_installed_formulae
-    outdated_kegs = formulae_maybe_with_kegs
-                    .map(&:linked_keg)
-                    .select(&:directory?)
-                    .map { |k| Keg.new(k.resolved_path) }
-
-    fi = FormulaInstaller.new(f)
-    fi.options             = f.build.used_options
-    fi.options            &= f.options
-    fi.build_bottle        = ARGV.build_bottle? || (!f.bottled? && f.build.build_bottle?)
-    fi.build_from_source   = ARGV.build_from_source? || ARGV.build_all_from_source?
-    fi.verbose             = ARGV.verbose?
-    fi.quieter             = ARGV.quieter?
-    fi.debug               = ARGV.debug?
-    fi.prelude
-
-    oh1 "Upgrading #{f.full_specified_name} #{fi.options.to_a.join " "}"
-
-    # first we unlink the currently active keg for this formula otherwise it is
-    # possible for the existing build to interfere with the build we are about to
-    # do! Seriously, it happens!
-    outdated_kegs.each(&:unlink)
-
-    fi.install
-    fi.finish
-
-    # If the formula was pinned, and we were force-upgrading it, unpin and
-    # pin it again to get a symlink pointing to the correct keg.
-    if f.pinned?
-      f.unpin
-      f.pin
-    end
-  rescue FormulaInstallationAlreadyAttemptedError
-    # We already attempted to upgrade f as part of the dependency tree of
-    # another formula. In that case, don't generate an error, just move on.
-  rescue CannotInstallFormulaError => e
-    ofail e
-  rescue BuildError => e
-    e.dump
-    puts
-    Homebrew.failed = true
-  rescue DownloadError => e
-    ofail e
-  ensure
-    # restore previous installation state if build failed
-    begin
-      outdated_kegs.each(&:link) unless f.installed?
-    rescue
-      nil
-    end
+    Cask::Cmd::Upgrade.upgrade_casks(
+      *casks,
+      force:               args.force?,
+      greedy:              args.greedy?,
+      greedy_latest:       args.greedy_latest?,
+      greedy_auto_updates: args.greedy_auto_updates?,
+      dry_run:             args.dry_run?,
+      binaries:            args.binaries?,
+      quarantine:          args.quarantine?,
+      require_sha:         args.require_sha?,
+      skip_cask_deps:      args.skip_cask_deps?,
+      verbose:             args.verbose?,
+      args:                args,
+    )
   end
 end

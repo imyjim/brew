@@ -1,36 +1,31 @@
 # Troubleshooting
 
-**Run `brew update` twice and `brew doctor` *before* creating an issue!**
+**Run `brew update` twice and `brew doctor` (and fix all the warnings) *before* creating an issue!**
 
 This document will help you check for common issues and make sure your issue has not already been reported.
 
-
 ## Check for common issues
 
-Follow these steps to fix common problems:
-
-* Run `brew update` twice.
-* Run `brew doctor` and fix all the warnings (**outdated Xcode/CLT and unbrewed dylibs are very likely to cause problems**).
-* Check that **Command Line Tools for Xcode (CLT)** and **Xcode** are up to date.
-* If commands fail with permissions errors, check the permissions of `/usr/local`'s subdirectories. If you’re unsure what to do, you can run `cd /usr/local && sudo chown -R $(whoami) bin etc include lib sbin share var Frameworks`.
-* Read through the [Common Issues](Common-Issues.md).
-* If you’re installing something Java-related, make sure you have installed Java (you can run `brew cask install java`).
-
+* Read through the list of [Common Issues](Common-Issues.md).
 
 ## Check to see if the issue has been reported
 
-* Search the [issue tracker](https://github.com/Homebrew/homebrew-core/issues) to see if someone else has already reported the same issue.
-* Make sure you search issues on the correct repository. If a formula that has failed to build is part of a tap like [homebrew/science](https://github.com/Homebrew/homebrew-science/issues) or [homebrew/dupes](https://github.com/Homebrew/homebrew-dupes/issues) check those issue trackers instead.
-
+* Search the appropriate issue tracker to see if someone else has already reported the same issue:
+  * [Homebrew/homebrew-core issue tracker](https://github.com/Homebrew/homebrew-core/issues) (formulae)
+  * [Homebrew/homebrew-cask issue tracker](https://github.com/Homebrew/homebrew-cask/issues) (casks)
+  * [Homebrew/brew issue tracker](https://github.com/Homebrew/brew/issues) (`brew` itself)
+* If the formula or cask that has failed to install is part of a non-Homebrew tap, then check that tap's issue tracker instead.
+* Search the [Homebrew discussion forum](https://github.com/homebrew/discussions/discussions) or [Discourse archive](https://discourse.brew.sh/) to see if any discussions have started about the issue.
 
 ## Create an issue
 
 If your problem hasn't been solved or reported, then create an issue:
 
-0. Upload debugging information to a [Gist](https://gist.github.com):
-  - If you had a formula-related problem: run `brew gist-logs <formula>` (where `<formula>` is the name of the formula).
-  - If you encountered a non-formula problem: upload the output of `brew config` and `brew doctor` to a new [Gist](https://gist.github.com).
-1. [Create a new issue](https://github.com/Homebrew/homebrew-core/issues/new).
-  - Give your issue a descriptive title which includes the formula name (if applicable) and the version of macOS you are using. For example, if a formula fails to build, title your issue "\<formula name> failed to build on \<10.x>", where "\<formula name>" is the name of the formula that failed to build, and "\<10.x>" is the version of macOS you are using.
-  - Include the URL output by `brew gist-logs <formula>` (if applicable).
-  - Include links to any additional Gists you may have created (such as for the output of `brew config` and `brew doctor`).
+1. Collect debugging information:
+  * If you have a problem with installing a formula: run `brew gist-logs <formula>` (where `<formula>` is the name of the formula) to upload the logs to a new [Gist](https://gist.github.com).
+  * If your have a non-formula problem: collect the output of `brew config` and `brew doctor`.
+
+1. Create a new issue on the issue tracker for [Homebrew/homebrew-core](https://github.com/Homebrew/homebrew-core/issues/new/choose), [Homebrew/homebrew-cask](https://github.com/Homebrew/homebrew-cask/issues/new/choose) or [Homebrew/brew](https://github.com/Homebrew/brew/issues/new/choose) and follow the instructions:
+  * Give your issue a descriptive title which includes the formula name (if applicable) and the version of macOS or Linux you are using. For example, if a formula fails to build, title your issue "\<formula> failed to build on \<platform>", where "\<formula>" is the name of the formula that failed to build, and "\<platform>" is the name and version of macOS or Linux you are using.
+  * Include the URL provided by `brew gist-logs <formula>` (if applicable) plus links to any additional Gists you may have created.
+  * Include the output of `brew config` and `brew doctor`.

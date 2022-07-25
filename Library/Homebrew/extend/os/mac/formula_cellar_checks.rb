@@ -1,4 +1,8 @@
-require "os/mac/linkage_checker"
+# typed: false
+# frozen_string_literal: true
+
+require "cache_store"
+require "linkage_checker"
 
 module FormulaCellarChecks
   def check_shadowed_headers
@@ -6,9 +10,7 @@ module FormulaCellarChecks
       formula.name.start_with?(formula_name)
     end
 
-    return if MacOS.version < :mavericks && formula.name.start_with?("postgresql")
-    return if MacOS.version < :yosemite  && formula.name.start_with?("memcached")
-
+    return if formula.name&.match?(Version.formula_optionally_versioned_regex(:php))
     return if formula.keg_only? || !formula.include.directory?
 
     files  = relative_glob(formula.include, "**/*.h")
@@ -17,15 +19,16 @@ module FormulaCellarChecks
 
     return if files.empty?
 
-    <<-EOS.undent
+    <<~EOS
       Header files that shadow system header files were installed to "#{formula.include}"
       The offending files are:
-        #{files * "\n        "}
+        #{files * "\n  "}
     EOS
   end
 
   def check_openssl_links
     return unless formula.prefix.directory?
+
     keg = Keg.new(formula.prefix)
     system_openssl = keg.mach_o_files.select do |obj|
       dlls = obj.dynamically_linked_libraries
@@ -33,12 +36,12 @@ module FormulaCellarChecks
     end
     return if system_openssl.empty?
 
-    <<-EOS.undent
+    <<~EOS
       object files were linked against system openssl
       These object files were linked against the deprecated system OpenSSL or
       the system's private LibreSSL.
       Adding `depends_on "openssl"` to the formula may help.
-        #{system_openssl * "\n        "}
+        #{system_openssl * "\n  "}
     EOS
   end
 
@@ -50,33 +53,77 @@ module FormulaCellarChecks
     end
     return if framework_links.empty?
 
-    <<-EOS.undent
+    <<~EOS
       python modules have explicit framework links
       These python extension modules were linked directly to a Python
       framework binary. They should be linked with -undefined dynamic_lookup
       instead of -lpython or -framework Python.
-        #{framework_links * "\n        "}
+        #{framework_links * "\n  "}
     EOS
   end
 
   def check_linkage
     return unless formula.prefix.directory?
-    keg = Keg.new(formula.prefix)
-    checker = LinkageChecker.new(keg, formula)
 
-    return unless checker.broken_dylibs?
-    audit_check_output <<-EOS.undent
-      The installation was broken.
-      Broken dylib links found:
-        #{checker.broken_dylibs.to_a * "\n          "}
+    keg = Keg.new(formula.prefix)
+
+    CacheStoreDatabase.use(:linkage) do |db|
+      checker = LinkageChecker.new(keg, formula, cache_db: db)
+      next unless checker.broken_library_linkage?
+
+      output = <<~EOS
+        #{formula} has broken dynamic library links:
+          #{checker.display_test_output}
+      EOS
+
+      tab = Tab.for_keg(keg)
+      if tab.poured_from_bottle
+        output += <<~EOS
+          Rebuild this from source with:
+            brew reinstall --build-from-source #{formula}
+          If that's successful, file an issue#{formula.tap ? " here:\n  #{formula.tap.issues_url}" : "."}
+        EOS
+      end
+      problem_if_output output
+    end
+  end
+
+  def check_flat_namespace(formula)
+    return unless formula.prefix.directory?
+    return if formula.tap.present? && formula.tap.audit_exception(:flat_namespace_allowlist, formula.name)
+
+    keg = Keg.new(formula.prefix)
+    flat_namespace_files = keg.mach_o_files.reject do |file|
+      next true unless file.dylib?
+
+      macho = MachO.open(file)
+      if MachO::Utils.fat_magic?(macho.magic)
+        macho.machos.map(&:header).all? { |h| h.flag? :MH_TWOLEVEL }
+      else
+        macho.header.flag? :MH_TWOLEVEL
+      end
+    end
+    return if flat_namespace_files.empty?
+
+    <<~EOS
+      Libraries were compiled with a flat namespace.
+      This can cause linker errors due to name collisions, and
+      is often due to a bug in detecting the macOS version.
+        #{flat_namespace_files * "\n  "}
     EOS
   end
 
   def audit_installed
     generic_audit_installed
-    audit_check_output(check_shadowed_headers)
-    audit_check_output(check_openssl_links)
-    audit_check_output(check_python_framework_links(formula.lib))
+    problem_if_output(check_shadowed_headers)
+    problem_if_output(check_openssl_links)
+    problem_if_output(check_python_framework_links(formula.lib))
     check_linkage
+    problem_if_output(check_flat_namespace(formula))
+  end
+
+  def valid_library_extension?(filename)
+    macos_lib_extensions = %w[.dylib .framework]
+    generic_valid_library_extension?(filename) || macos_lib_extensions.include?(filename.extname)
   end
 end

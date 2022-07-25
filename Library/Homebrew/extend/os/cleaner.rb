@@ -1,2 +1,8 @@
-require "cleaner"
-require "extend/os/mac/cleaner" if OS.mac?
+# typed: strict
+# frozen_string_literal: true
+
+if OS.mac?
+  require "extend/os/mac/cleaner"
+elsif OS.linux?
+  require "extend/os/linux/cleaner"
+end

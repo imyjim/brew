@@ -1,33 +1,49 @@
-#:  * `leaves`:
-#:    Show installed formulae that are not dependencies of another installed formula.
+# typed: true
+# frozen_string_literal: true
 
 require "formula"
-require "tab"
-require "set"
+require "cli/parser"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
+  sig { returns(CLI::Parser) }
+  def leaves_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        List installed formulae that are not dependencies of another installed formula.
+      EOS
+      switch "-r", "--installed-on-request",
+             description: "Only list leaves that were manually installed."
+      switch "-p", "--installed-as-dependency",
+             description: "Only list leaves that were installed as dependencies."
+
+      conflicts "--installed-on-request", "--installed-as-dependency"
+
+      named_args :none
+    end
+  end
+
+  def installed_on_request?(formula)
+    Tab.for_keg(formula.any_installed_keg).installed_on_request
+  end
+
+  def installed_as_dependency?(formula)
+    Tab.for_keg(formula.any_installed_keg).installed_as_dependency
+  end
+
   def leaves
-    installed = Formula.installed
-    deps_of_installed = Set.new
+    args = leaves_args.parse
 
-    installed.each do |f|
-      deps = []
+    leaves_list = Formula.installed_formulae_with_no_dependents
 
-      f.deps.each do |dep|
-        if dep.optional? || dep.recommended?
-          deps << dep.to_formula.full_name if f.build.with?(dep)
-        else
-          deps << dep.to_formula.full_name
-        end
-      end
+    leaves_list.select!(&method(:installed_on_request?)) if args.installed_on_request?
+    leaves_list.select!(&method(:installed_as_dependency?)) if args.installed_as_dependency?
 
-      deps_of_installed.merge(deps)
-    end
-
-    installed.each do |f|
-      puts f.full_name unless deps_of_installed.include? f.full_name
-    end
+    leaves_list.map(&:full_name)
+               .sort
+               .each(&method(:puts))
   end
 end

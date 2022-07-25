@@ -1,83 +1,78 @@
-# Used to track formulae that cannot be installed at the same time
+# typed: true
+# frozen_string_literal: true
+
+# Used to track formulae that cannot be installed at the same time.
 FormulaConflict = Struct.new(:name, :reason)
 
-# Used to annotate formulae that duplicate macOS provided software
+# Used to annotate formulae that duplicate macOS-provided software
 # or cause conflicts when linked in.
 class KegOnlyReason
+  extend T::Sig
+
+  attr_reader :reason
+
   def initialize(reason, explanation)
     @reason = reason
     @explanation = explanation
   end
 
-  def valid?
-    case @reason
-    when :provided_pre_mountain_lion
-      MacOS.version < :mountain_lion
-    when :provided_pre_mavericks
-      MacOS.version < :mavericks
-    when :provided_pre_el_capitan
-      MacOS.version < :el_capitan
-    when :provided_until_xcode43
-      MacOS::Xcode.installed? && MacOS::Xcode.version < "4.3"
-    when :provided_until_xcode5
-      MacOS::Xcode.installed? && MacOS::Xcode.version < "5.0"
-    else
-      true
-    end
+  def versioned_formula?
+    @reason == :versioned_formula
+  end
+
+  def provided_by_macos?
+    @reason == :provided_by_macos
+  end
+
+  def shadowed_by_macos?
+    @reason == :shadowed_by_macos
+  end
+
+  def by_macos?
+    provided_by_macos? || shadowed_by_macos?
+  end
+
+  sig { returns(T::Boolean) }
+  def applicable?
+    # macOS reasons aren't applicable on other OSs
+    # (see extend/os/mac/formula_support for override on macOS)
+    !by_macos?
   end
 
   def to_s
     return @explanation unless @explanation.empty?
-    case @reason
-    when :provided_by_macos, :provided_by_osx then <<-EOS
-macOS already provides this software and installing another version in
-parallel can cause all kinds of trouble.
-EOS
-    when :shadowed_by_macos, :shadowed_by_osx then <<-EOS
-macOS provides similar software and installing this software in
-parallel can cause all kinds of trouble.
-EOS
-    when :provided_pre_mountain_lion then <<-EOS
-macOS already provides this software in versions before Mountain Lion.
-EOS
-    when :provided_pre_mavericks then <<-EOS
-macOS already provides this software in versions before Mavericks.
-EOS
-    when :provided_pre_el_capitan then <<-EOS
-macOS already provides this software in versions before El Capitan.
-EOS
-    when :provided_until_xcode43
-      "Xcode provides this software prior to version 4.3."
-    when :provided_until_xcode5
-      "Xcode provides this software prior to version 5."
+
+    if versioned_formula?
+      <<~EOS
+        this is an alternate version of another formula
+      EOS
+    elsif provided_by_macos?
+      <<~EOS
+        macOS already provides this software and installing another version in
+        parallel can cause all kinds of trouble
+      EOS
+    elsif shadowed_by_macos?
+      <<~EOS
+        macOS provides similar software and installing this software in
+        parallel can cause all kinds of trouble
+      EOS
     else
       @reason
     end.strip
   end
-end
 
-# Used to annotate formulae that don't require compiling or cannot build bottle.
-class BottleDisableReason
-  SUPPORTED_TYPES = [:unneeded, :disable].freeze
-
-  def initialize(type, reason)
-    @type = type
-    @reason = reason
-  end
-
-  def unneeded?
-    @type == :unneeded
-  end
-
-  def valid?
-    SUPPORTED_TYPES.include? @type
-  end
-
-  def to_s
-    if @type == :unneeded
-      "This formula doesn't require compiling."
+  def to_hash
+    reason_string = if @reason.is_a?(Symbol)
+      @reason.inspect
     else
-      @reason
+      @reason.to_s
     end
+
+    {
+      "reason"      => reason_string,
+      "explanation" => @explanation,
+    }
   end
 end
+
+require "extend/os/formula_support"

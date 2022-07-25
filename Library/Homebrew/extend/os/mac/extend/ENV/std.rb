@@ -1,74 +1,51 @@
+# typed: false
+# frozen_string_literal: true
+
 module Stdenv
   # @private
-  def setup_build_environment(formula = nil)
-    generic_setup_build_environment formula
 
-    if MacOS.version >= :mountain_lion
-      # Mountain Lion's sed is stricter, and errors out when
-      # it encounters files with mixed character sets
-      delete("LC_ALL")
-      self["LC_CTYPE"]="C"
-    end
-
-    # Add lib and include etc. from the current macosxsdk to compiler flags:
-    macosxsdk MacOS.version
-
-    if MacOS::Xcode.without_clt?
-      append_path "PATH", "#{MacOS::Xcode.prefix}/usr/bin"
-      append_path "PATH", "#{MacOS::Xcode.toolchain_path}/usr/bin"
-    end
-
-    # Leopard's ld needs some convincing that it's building 64-bit
-    # See: https://github.com/mistydemeo/tigerbrew/issues/59
-    return unless MacOS.version == :leopard && MacOS.prefer_64_bit?
-    append "LDFLAGS", "-arch #{Hardware::CPU.arch_64_bit}"
-
-    # Many, many builds are broken thanks to Leopard's buggy ld.
-    # Our ld64 fixes many of those builds, though of course we can't
-    # depend on it already being installed to build itself.
-    ld64 if Formula["ld64"].installed?
-  end
+  undef homebrew_extra_pkg_config_paths
 
   def homebrew_extra_pkg_config_paths
     ["#{HOMEBREW_LIBRARY}/Homebrew/os/mac/pkgconfig/#{MacOS.version}"]
   end
 
-  # Sets architecture-specific flags for every environment variable
-  # given in the list `flags`.
-  # @private
-  def set_cpu_flags(flags, default = DEFAULT_FLAGS, map = Hardware::CPU.optimization_flags)
-    generic_set_cpu_flags(flags, default, map)
+  def setup_build_environment(formula: nil, cc: nil, build_bottle: false, bottle_arch: nil, testing_formula: false)
+    generic_setup_build_environment(
+      formula: formula, cc: cc, build_bottle: build_bottle,
+      bottle_arch: bottle_arch, testing_formula: testing_formula
+    )
 
-    # Works around a buggy system header on Tiger
-    append flags, "-faltivec" if MacOS.version == :tiger
+    append "LDFLAGS", "-Wl,-headerpad_max_install_names"
+
+    # sed is strict, and errors out when it encounters files with
+    # mixed character sets
+    delete("LC_ALL")
+    self["LC_CTYPE"] = "C"
+
+    # Add lib and include etc. from the current macosxsdk to compiler flags:
+    macosxsdk(formula: @formula, testing_formula: testing_formula)
+
+    return unless MacOS::Xcode.without_clt?
+
+    append_path "PATH", "#{MacOS::Xcode.prefix}/usr/bin"
+    append_path "PATH", "#{MacOS::Xcode.toolchain_path}/usr/bin"
   end
 
-  def minimal_optimization
-    generic_minimal_optimization
-
-    macosxsdk unless MacOS::CLT.installed?
-  end
-
-  def no_optimization
-    generic_no_optimization
-
-    macosxsdk unless MacOS::CLT.installed?
-  end
-
-  def remove_macosxsdk(version = MacOS.version)
+  def remove_macosxsdk(version = nil)
     # Clear all lib and include dirs from CFLAGS, CPPFLAGS, LDFLAGS that were
     # previously added by macosxsdk
-    version = version.to_s
-    remove_from_cflags(/ ?-mmacosx-version-min=10\.\d+/)
-    delete("MACOSX_DEPLOYMENT_TARGET")
+    remove_from_cflags(/ ?-mmacosx-version-min=\d+\.\d+/)
     delete("CPATH")
     remove "LDFLAGS", "-L#{HOMEBREW_PREFIX}/lib"
 
-    return unless (sdk = MacOS.sdk_path(version)) && !MacOS::CLT.installed?
+    sdk = self["SDKROOT"] || MacOS.sdk_path_if_needed(version)
+    return unless sdk
+
     delete("SDKROOT")
-    remove_from_cflags "-isysroot #{sdk}"
-    remove "CPPFLAGS", "-isysroot #{sdk}"
-    remove "LDFLAGS", "-isysroot #{sdk}"
+    remove_from_cflags "-isysroot#{sdk}"
+    remove "CPPFLAGS", "-isysroot#{sdk}"
+    remove "LDFLAGS", "-isysroot#{sdk}"
     if HOMEBREW_PREFIX.to_s == "/usr/local"
       delete("CMAKE_PREFIX_PATH")
     else
@@ -78,65 +55,48 @@ module Stdenv
     remove "CMAKE_FRAMEWORK_PATH", "#{sdk}/System/Library/Frameworks"
   end
 
-  def macosxsdk(version = MacOS.version)
+  def macosxsdk(version = nil, formula: nil, testing_formula: false)
     # Sets all needed lib and include dirs to CFLAGS, CPPFLAGS, LDFLAGS.
     remove_macosxsdk
-    version = version.to_s
-    append_to_cflags("-mmacosx-version-min=#{version}")
-    self["MACOSX_DEPLOYMENT_TARGET"] = version
+    min_version = version || MacOS.version
+    append_to_cflags("-mmacosx-version-min=#{min_version}")
     self["CPATH"] = "#{HOMEBREW_PREFIX}/include"
     prepend "LDFLAGS", "-L#{HOMEBREW_PREFIX}/lib"
 
-    return unless (sdk = MacOS.sdk_path(version)) && !MacOS::CLT.installed?
+    sdk = if formula
+      MacOS.sdk_for_formula(formula, version, check_only_runtime_requirements: testing_formula)
+    else
+      MacOS.sdk(version)
+    end
+    return if !MacOS.sdk_root_needed? && sdk&.source != :xcode
+
+    Homebrew::Diagnostic.checks(:fatal_setup_build_environment_checks)
+    sdk = sdk.path
+
     # Extra setup to support Xcode 4.3+ without CLT.
     self["SDKROOT"] = sdk
     # Tell clang/gcc where system include's are:
     append_path "CPATH", "#{sdk}/usr/include"
     # The -isysroot is needed, too, because of the Frameworks
-    append_to_cflags "-isysroot #{sdk}"
-    append "CPPFLAGS", "-isysroot #{sdk}"
+    append_to_cflags "-isysroot#{sdk}"
+    append "CPPFLAGS", "-isysroot#{sdk}"
     # And the linker needs to find sdk/usr/lib
-    append "LDFLAGS", "-isysroot #{sdk}"
+    append "LDFLAGS", "-isysroot#{sdk}"
     # Needed to build cmake itself and perhaps some cmake projects:
     append_path "CMAKE_PREFIX_PATH", "#{sdk}/usr"
     append_path "CMAKE_FRAMEWORK_PATH", "#{sdk}/System/Library/Frameworks"
   end
 
-  # Some configure scripts won't find libxml2 without help
+  # Some configure scripts won't find libxml2 without help.
+  # This is a no-op with macOS SDK 10.15.4 and later.
   def libxml2
-    if MacOS::CLT.installed?
+    sdk = self["SDKROOT"] || MacOS.sdk_path_if_needed
+    if !sdk
       append "CPPFLAGS", "-I/usr/include/libxml2"
-    else
+    elsif !Pathname("#{sdk}/usr/include/libxml").directory?
       # Use the includes form the sdk
-      append "CPPFLAGS", "-I#{MacOS.sdk_path}/usr/include/libxml2"
+      append "CPPFLAGS", "-I#{sdk}/usr/include/libxml2"
     end
-  end
-
-  def x11
-    # There are some config scripts here that should go in the PATH
-    append_path "PATH", MacOS::X11.bin.to_s
-
-    # Append these to PKG_CONFIG_LIBDIR so they are searched
-    # *after* our own pkgconfig directories, as we dupe some of the
-    # libs in XQuartz.
-    append_path "PKG_CONFIG_LIBDIR", "#{MacOS::X11.lib}/pkgconfig"
-    append_path "PKG_CONFIG_LIBDIR", "#{MacOS::X11.share}/pkgconfig"
-
-    append "LDFLAGS", "-L#{MacOS::X11.lib}"
-    append_path "CMAKE_PREFIX_PATH", MacOS::X11.prefix.to_s
-    append_path "CMAKE_INCLUDE_PATH", MacOS::X11.include.to_s
-    append_path "CMAKE_INCLUDE_PATH", "#{MacOS::X11.include}/freetype2"
-
-    append "CPPFLAGS", "-I#{MacOS::X11.include}"
-    append "CPPFLAGS", "-I#{MacOS::X11.include}/freetype2"
-
-    append_path "ACLOCAL_PATH", "#{MacOS::X11.share}/aclocal"
-
-    if MacOS::XQuartz.provided_by_apple? && !MacOS::CLT.installed?
-      append_path "CMAKE_PREFIX_PATH", "#{MacOS.sdk_path}/usr/X11"
-    end
-
-    append "CFLAGS", "-I#{MacOS::X11.include}" unless MacOS::CLT.installed?
   end
 
   def no_weak_imports

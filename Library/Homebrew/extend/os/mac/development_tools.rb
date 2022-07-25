@@ -1,15 +1,24 @@
+# typed: true
+# frozen_string_literal: true
+
 require "os/mac/xcode"
 
 # @private
 class DevelopmentTools
   class << self
-    alias original_locate locate
+    extend T::Sig
+
+    alias generic_locate locate
+    undef installed?, default_compiler, curl_handles_most_https_certificates?,
+          subversion_handles_most_https_certificates?
+
+    sig { params(tool: String).returns(T.nilable(Pathname)) }
     def locate(tool)
       (@locate ||= {}).fetch(tool) do |key|
-        @locate[key] = if (located_tool = original_locate(tool))
+        @locate[key] = if (located_tool = generic_locate(tool))
           located_tool
-        elsif MacOS.version > :tiger
-          path = Utils.popen_read("/usr/bin/xcrun", "-no-cache", "-find", tool).chomp
+        else
+          path = Utils.popen_read("/usr/bin/xcrun", "-no-cache", "-find", tool, err: :close).chomp
           Pathname.new(path) if File.executable?(path)
         end
       end
@@ -18,67 +27,51 @@ class DevelopmentTools
     # Checks if the user has any developer tools installed, either via Xcode
     # or the CLT. Convenient for guarding against formula builds when building
     # is impossible.
+    sig { returns(T::Boolean) }
     def installed?
       MacOS::Xcode.installed? || MacOS::CLT.installed?
     end
 
-    def installation_instructions
-      if MacOS.version >= "10.9"
-        <<-EOS.undent
-          Install the Command Line Tools:
-            xcode-select --install
-        EOS
-      elsif MacOS.version == "10.8" || MacOS.version == "10.7"
-        <<-EOS.undent
-          Install the Command Line Tools from
-            https://developer.apple.com/downloads/
-          or via Xcode's preferences.
-        EOS
-      else
-        <<-EOS.undent
-          Install Xcode from
-            https://developer.apple.com/xcode/downloads/
-        EOS
-      end
-    end
-
-    def custom_installation_instructions
-      if MacOS.version > :tiger
-        <<-EOS.undent
-          Install GNU's GCC
-            brew install gcc
-        EOS
-      else
-        # Tiger doesn't ship with apple-gcc42, and this is required to build
-        # some software that doesn't build properly with FSF GCC.
-        <<-EOS.undent
-          Install Apple's GCC
-            brew install apple-gcc42
-          or GNU's GCC
-            brew install gcc
-        EOS
-      end
-    end
-
+    sig { returns(Symbol) }
     def default_compiler
-      case default_cc
-      # if GCC 4.2 is installed, e.g. via Tigerbrew, prefer it
-      # over the system's GCC 4.0
-      when /^gcc-4\.0/ then gcc_42_build_version ? :gcc : :gcc_4_0
-      when /^gcc/ then :gcc
-      when "clang" then :clang
-      else
-        # guess :(
-        if MacOS::Xcode.version >= "4.3"
-          :clang
-        else
-          :gcc
-        end
-      end
+      :clang
     end
 
-    def tar_supports_xz?
-      false
+    sig { returns(T::Boolean) }
+    def curl_handles_most_https_certificates?
+      # The system Curl is too old for some modern HTTPS certificates on
+      # older macOS versions.
+      ENV["HOMEBREW_SYSTEM_CURL_TOO_OLD"].nil?
+    end
+
+    sig { returns(T::Boolean) }
+    def subversion_handles_most_https_certificates?
+      # The system Subversion is too old for some HTTPS certificates on
+      # older macOS versions.
+      MacOS.version >= :sierra
+    end
+
+    sig { returns(String) }
+    def installation_instructions
+      MacOS::CLT.installation_instructions
+    end
+
+    sig { returns(String) }
+    def custom_installation_instructions
+      <<~EOS
+        Install GNU's GCC:
+          brew install gcc
+      EOS
+    end
+
+    sig { returns(T::Hash[String, T.nilable(String)]) }
+    def build_system_info
+      build_info = {
+        "xcode"          => MacOS::Xcode.version.to_s.presence,
+        "clt"            => MacOS::CLT.version.to_s.presence,
+        "preferred_perl" => MacOS.preferred_perl_version,
+      }
+      generic_build_system_info.merge build_info
     end
   end
 end

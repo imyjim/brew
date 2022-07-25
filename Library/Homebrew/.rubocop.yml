@@ -1,54 +1,63 @@
 inherit_from:
-  - ../.rubocop.yml
+  - ../.rubocop_rspec.yml
   - .rubocop_todo.yml
 
-AllCops:
-  Include:
-    - '**/.simplecov'
+# make rspec formatting more flexible
+Layout/MultilineMethodCallIndentation:
   Exclude:
-    - '**/Casks/**/*'
-    - '**/vendor/**/*'
-
-Style/BlockDelimiters:
-  Exclude:
-    - '**/cask/spec/**/*'
-    - '**/cask/test/**/*'
-
-# so many of these in formulae but none in here
-Lint/AmbiguousRegexpLiteral:
-  Enabled: true
+    - "**/*_spec.rb"
 
 # `formula do` uses nested method definitions
 Lint/NestedMethodDefinition:
   Exclude:
-    - 'test/**/*'
+    - "test/**/*"
 
-# so many of these in formulae but none in here
-Lint/ParenthesesAsGroupedExpression:
-  Enabled: true
-
+# TODO: Try to bring down all metrics maximums.
+Metrics/AbcSize:
+  Max: 280
+Metrics/BlockLength:
+  Max: 106
+  Exclude:
+    # TODO: extract more of the bottling logic
+    - "dev-cmd/bottle.rb"
+    - "test/**/*"
+Metrics/BlockNesting:
+  Max: 5
+Metrics/ClassLength:
+  Max: 800
+  Exclude:
+    - "formula.rb"
+    - "formula_installer.rb"
+Metrics/CyclomaticComplexity:
+  Max: 80
+Metrics/PerceivedComplexity:
+  Max: 90
+Metrics/MethodLength:
+  Max: 260
 Metrics/ModuleLength:
-  CountComments: false
+  Max: 500
   Exclude:
-    - 'cask/lib/hbc/locations.rb'
-    - 'cask/lib/hbc/macos.rb'
-    - 'cask/lib/hbc/utils.rb'
+    # TODO: extract more of the bottling logic
+    - "dev-cmd/bottle.rb"
+    # TODO: try break this down
+    - "utils/github.rb"
+    - "test/**/*"
 
-# so many of these in formulae but none in here
-Style/GuardClause:
-  Enabled: true
+Naming/PredicateName:
+  # Can't rename these.
+  AllowedMethods:
+    - is_a?
+    - is_32_bit?
+    - is_64_bit?
 
-# hash-rockets preferred for formulae, a: 1 preferred elsewhere
-Style/HashSyntax:
-  EnforcedStyle: ruby19_no_mixed_keys
-
-# we won't change backward compatible method names
-Style/MethodName:
+Style/HashAsLastArrayItem:
   Exclude:
-    - 'compat/**/*'
+    - "test/utils/spdx_spec.rb"
 
-# we won't change backward compatible predicate names
-Style/PredicateName:
+Style/BlockDelimiters:
+  BracesRequiredMethods:
+    - "sig"
+
+Bundler/GemFilename:
   Exclude:
-    - 'compat/**/*'
-  NameWhitelist: is_32_bit?, is_64_bit?
+    - "utils/gems.rb"

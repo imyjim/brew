@@ -1,190 +1,163 @@
-#:  * `search`, `-S`:
-#:    Display all locally available formulae for brewing (including tapped ones).
-#:    No online search is performed if called without arguments.
-#:
-#:  * `search` [`--desc`] <text>|`/`<text>`/`:
-#:    Perform a substring search of formula names for <text>. If <text> is
-#:    surrounded with slashes, then it is interpreted as a regular expression.
-#:    The search for <text> is extended online to some popular taps.
-#:
-#:    If `--desc` is passed, browse available packages matching <text> including a
-#:    description for each.
-#:
-#:  * `search` (`--debian`|`--fedora`|`--fink`|`--macports`|`--opensuse`|`--ubuntu`) <text>:
-#:    Search for <text> in the given package manager's list.
+# typed: false
+# frozen_string_literal: true
 
 require "formula"
-require "blacklist"
-require "utils"
-require "thread"
-require "official_taps"
+require "missing_formula"
 require "descriptions"
+require "cli/parser"
+require "search"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
-  SEARCH_ERROR_QUEUE = Queue.new
+  extend Search
+
+  PACKAGE_MANAGERS = {
+    repology:  ->(query) { "https://repology.org/projects/?search=#{query}" },
+    macports:  ->(query) { "https://ports.macports.org/search/?q=#{query}" },
+    fink:      ->(query) { "https://pdb.finkproject.org/pdb/browse.php?summary=#{query}" },
+    opensuse:  ->(query) { "https://software.opensuse.org/search?q=#{query}" },
+    fedora:    ->(query) { "https://apps.fedoraproject.org/packages/s/#{query}" },
+    archlinux: ->(query) { "https://archlinux.org/packages/?q=#{query}" },
+    debian:    lambda { |query|
+      "https://packages.debian.org/search?keywords=#{query}&searchon=names&suite=all&section=all"
+    },
+    ubuntu:    lambda { |query|
+      "https://packages.ubuntu.com/search?keywords=#{query}&searchon=names&suite=all&section=all"
+    },
+  }.freeze
+
+  sig { returns(CLI::Parser) }
+  def search_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Perform a substring search of cask tokens and formula names for <text>. If <text>
+        is flanked by slashes, it is interpreted as a regular expression.
+        The search for <text> is extended online to `homebrew/core` and `homebrew/cask`.
+      EOS
+      switch "--formula", "--formulae",
+             description: "Search online and locally for formulae."
+      switch "--cask", "--casks",
+             description: "Search online and locally for casks."
+      switch "--desc",
+             description: "Search for formulae with a description matching <text> and casks with " \
+                          "a name or description matching <text>."
+      switch "--pull-request",
+             description: "Search for GitHub pull requests containing <text>."
+      switch "--open",
+             depends_on:  "--pull-request",
+             description: "Search for only open GitHub pull requests."
+      switch "--closed",
+             depends_on:  "--pull-request",
+             description: "Search for only closed GitHub pull requests."
+      package_manager_switches = PACKAGE_MANAGERS.keys.map { |name| "--#{name}" }
+      package_manager_switches.each do |s|
+        switch s,
+               description: "Search for <text> in the given database."
+      end
+
+      conflicts "--desc", "--pull-request"
+      conflicts "--open", "--closed"
+      conflicts(*package_manager_switches)
+
+      named_args :text_or_regex, min: 1
+    end
+  end
 
   def search
-    if ARGV.empty?
-      puts Formatter.columns(Formula.full_names)
-    elsif ARGV.include? "--macports"
-      exec_browser "https://www.macports.org/ports.php?by=name&substr=#{ARGV.next}"
-    elsif ARGV.include? "--fink"
-      exec_browser "http://pdb.finkproject.org/pdb/browse.php?summary=#{ARGV.next}"
-    elsif ARGV.include? "--debian"
-      exec_browser "https://packages.debian.org/search?keywords=#{ARGV.next}&searchon=names&suite=all&section=all"
-    elsif ARGV.include? "--opensuse"
-      exec_browser "https://software.opensuse.org/search?q=#{ARGV.next}"
-    elsif ARGV.include? "--fedora"
-      exec_browser "https://admin.fedoraproject.org/pkgdb/packages/%2A#{ARGV.next}%2A/"
-    elsif ARGV.include? "--ubuntu"
-      exec_browser "http://packages.ubuntu.com/search?keywords=#{ARGV.next}&searchon=names&suite=all&section=all"
-    elsif ARGV.include? "--desc"
-      query = ARGV.next
-      regex = query_regexp(query)
-      Descriptions.search(regex, :desc).print
-    elsif ARGV.first =~ HOMEBREW_TAP_FORMULA_REGEX
-      query = ARGV.first
-      user, repo, name = query.split("/", 3)
+    args = search_args.parse
 
-      begin
-        result = Formulary.factory(query).name
-      rescue FormulaUnavailableError
-        result = search_tap(user, repo, name)
-      end
+    return if search_package_manager(args)
 
-      results = Array(result)
-      puts Formatter.columns(results) unless results.empty?
+    query = args.named.join(" ")
+    string_or_regex = query_regexp(query)
+
+    if args.desc?
+      search_descriptions(string_or_regex, args)
+    elsif args.pull_request?
+      search_pull_requests(query, args)
     else
-      query = ARGV.first
-      regex = query_regexp(query)
-      local_results = search_formulae(regex)
-      puts Formatter.columns(local_results) unless local_results.empty?
-      tap_results = search_taps(regex)
-      puts Formatter.columns(tap_results) unless tap_results.empty?
-
-      if $stdout.tty?
-        count = local_results.length + tap_results.length
-
-        if msg = blacklisted?(query)
-          if count > 0
-            puts
-            puts "If you meant #{query.inspect} precisely:"
-            puts
-          end
-          puts msg
-        elsif count.zero?
-          puts "No formula found for #{query.inspect}."
-          begin
-            GitHub.print_pull_requests_matching(query)
-          rescue GitHub::Error => e
-            SEARCH_ERROR_QUEUE << e
-          end
-        end
-      end
+      search_names(query, string_or_regex, args)
     end
 
-    if $stdout.tty?
-      metacharacters = %w[\\ | ( ) [ ] { } ^ $ * + ?]
-      bad_regex = metacharacters.any? do |char|
-        ARGV.any? do |arg|
-          arg.include?(char) && !arg.start_with?("/")
-        end
-      end
-      if !ARGV.empty? && bad_regex
-        ohai "Did you mean to perform a regular expression search?"
-        ohai "Surround your query with /slashes/ to search by regex."
-      end
-    end
-
-    raise SEARCH_ERROR_QUEUE.pop unless SEARCH_ERROR_QUEUE.empty?
+    print_regex_help(args)
   end
 
-  SEARCHABLE_TAPS = OFFICIAL_TAPS.map { |tap| ["Homebrew", tap] } + [
-    %w[Caskroom cask],
-    %w[Caskroom versions],
-  ]
+  def print_regex_help(args)
+    return unless $stdout.tty?
 
-  def query_regexp(query)
-    case query
-    when %r{^/(.*)/$} then Regexp.new($1)
-    else /.*#{Regexp.escape(query)}.*/i
+    metacharacters = %w[\\ | ( ) [ ] { } ^ $ * + ?].freeze
+    return unless metacharacters.any? do |char|
+      args.named.any? do |arg|
+        arg.include?(char) && !arg.start_with?("/")
+      end
     end
-  rescue RegexpError
-    odie "#{query} is not a valid regex"
+
+    opoo <<~EOS
+      Did you mean to perform a regular expression search?
+      Surround your query with /slashes/ to search locally by regex.
+    EOS
   end
 
-  def search_taps(regex_or_string)
-    SEARCHABLE_TAPS.map do |user, repo|
-      Thread.new { search_tap(user, repo, regex_or_string) }
-    end.inject([]) do |results, t|
-      results.concat(t.value)
-    end
+  def search_package_manager(args)
+    package_manager = PACKAGE_MANAGERS.find { |name,| args[:"#{name}?"] }
+    return false if package_manager.nil?
+
+    _, url = package_manager
+    exec_browser url.call(URI.encode_www_form_component(args.named.join(" ")))
+    true
   end
 
-  def search_tap(user, repo, regex_or_string)
-    regex = regex_or_string.is_a?(String) ? /^#{Regexp.escape(regex_or_string)}$/ : regex_or_string
-
-    if (HOMEBREW_LIBRARY/"Taps/#{user.downcase}/homebrew-#{repo.downcase}").directory? && \
-       user != "Caskroom"
-      return []
+  def search_pull_requests(query, args)
+    only = if args.open? && !args.closed?
+      "open"
+    elsif args.closed? && !args.open?
+      "closed"
     end
 
-    remote_tap_formulae = Hash.new do |cache, key|
-      user, repo = key.split("/", 2)
-      tree = {}
-
-      GitHub.open "https://api.github.com/repos/#{user}/homebrew-#{repo}/git/trees/HEAD?recursive=1" do |json|
-        json["tree"].each do |object|
-          next unless object["type"] == "blob"
-
-          subtree, file = File.split(object["path"])
-
-          if File.extname(file) == ".rb"
-            tree[subtree] ||= []
-            tree[subtree] << file
-          end
-        end
-      end
-
-      paths = tree["Formula"] || tree["HomebrewFormula"] || tree["."] || []
-      paths += tree["Casks"] || []
-      cache[key] = paths.map { |path| File.basename(path, ".rb") }
-    end
-
-    names = remote_tap_formulae["#{user}/#{repo}"]
-    user = user.downcase if user == "Homebrew" # special handling for the Homebrew organization
-    names.select { |name| name =~ regex }.map { |name| "#{user}/#{repo}/#{name}" }
-  rescue GitHub::HTTPNotFoundError
-    opoo "Failed to search tap: #{user}/#{repo}. Please run `brew update`"
-    []
-  rescue GitHub::Error => e
-    SEARCH_ERROR_QUEUE << e
-    []
+    GitHub.print_pull_requests_matching(query, only)
   end
 
-  def search_formulae(regex)
-    aliases = Formula.alias_full_names
-    results = (Formula.full_names+aliases).grep(regex).sort
+  def search_names(query, string_or_regex, args)
+    remote_results = search_taps(query, silent: true)
 
-    results.map do |name|
-      begin
-        formula = Formulary.factory(name)
-        canonical_name = formula.name
-        canonical_full_name = formula.full_name
-      rescue
-        canonical_name = canonical_full_name = name
-      end
+    local_formulae = search_formulae(string_or_regex)
+    remote_formulae = remote_results[:formulae]
+    all_formulae = local_formulae + remote_formulae
 
-      # Ignore aliases from results when the full name was also found
-      next if aliases.include?(name) && results.include?(canonical_full_name)
+    local_casks = search_casks(string_or_regex)
+    remote_casks = remote_results[:casks]
+    all_casks = local_casks + remote_casks
 
-      if (HOMEBREW_CELLAR/canonical_name).directory?
-        pretty_installed(name)
-      else
-        name
-      end
-    end.compact
+    print_formulae = args.formula?
+    print_casks = args.cask?
+    print_formulae = print_casks = true if !print_formulae && !print_casks
+    print_formulae &&= all_formulae.any?
+    print_casks &&= all_casks.any?
+
+    ohai "Formulae", Formatter.columns(all_formulae) if print_formulae
+    puts if print_formulae && print_casks
+    ohai "Casks", Formatter.columns(all_casks) if print_casks
+
+    count = all_formulae.count + all_casks.count
+
+    print_missing_formula_help(query, count.positive?) if local_casks.exclude?(query)
+
+    odie "No formulae or casks found for #{query.inspect}." if count.zero?
+  end
+
+  def print_missing_formula_help(query, found_matches)
+    return unless $stdout.tty?
+
+    reason = MissingFormula.reason(query, silent: true)
+    return if reason.nil?
+
+    if found_matches
+      puts
+      puts "If you meant #{query.inspect} specifically:"
+    end
+    puts reason
   end
 end

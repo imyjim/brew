@@ -1,41 +1,58 @@
-require "utils"
-require "language/python_virtualenv_constants"
+# typed: false
+# frozen_string_literal: true
 
 module Language
+  # Helper functions for Python formulae.
+  #
+  # @api public
   module Python
     def self.major_minor_version(python)
-      version = /\d\.\d/.match `#{python} --version 2>&1`
+      version = /\d\.\d+/.match `#{python} --version 2>&1`
       return unless version
+
       Version.create(version.to_s)
     end
 
-    def self.homebrew_site_packages(version = "2.7")
-      HOMEBREW_PREFIX/"lib/python#{version}/site-packages"
+    def self.homebrew_site_packages(python = "python3.7")
+      HOMEBREW_PREFIX/site_packages(python)
+    end
+
+    def self.site_packages(python = "python3.7")
+      if (python == "pypy") || (python == "pypy3")
+        "site-packages"
+      else
+        "lib/python#{major_minor_version python}/site-packages"
+      end
     end
 
     def self.each_python(build, &block)
-      original_pythonpath = ENV["PYTHONPATH"]
-      ["python", "python3"].each do |python|
-        next if build.without? python
+      original_pythonpath = ENV.fetch("PYTHONPATH", nil)
+      pythons = { "python@3" => "python3",
+                  "pypy"     => "pypy",
+                  "pypy3"    => "pypy3" }
+      pythons.each do |python_formula, python|
+        python_formula = Formulary.factory(python_formula)
+        next if build.without? python_formula.to_s
+
         version = major_minor_version python
-        ENV["PYTHONPATH"] = if Formulary.factory(python).installed?
+        ENV["PYTHONPATH"] = if python_formula.latest_version_installed?
           nil
         else
-          homebrew_site_packages(version)
+          homebrew_site_packages(python)
         end
-        block.call python, version if block
+        block&.call python, version
       end
       ENV["PYTHONPATH"] = original_pythonpath
     end
 
     def self.reads_brewed_pth_files?(python)
-      version = major_minor_version python
-      return unless homebrew_site_packages(version).directory?
-      return unless homebrew_site_packages(version).writable_real?
-      probe_file = homebrew_site_packages(version)/"homebrew-pth-probe.pth"
+      return unless homebrew_site_packages(python).directory?
+      return unless homebrew_site_packages(python).writable_real?
+
+      probe_file = homebrew_site_packages(python)/"homebrew-pth-probe.pth"
       begin
         probe_file.atomic_write("import site; site.homebrew_was_here = True")
-        quiet_system python, "-c", "import site; assert(site.homebrew_was_here)"
+        with_homebrew_path { quiet_system python, "-c", "import site; assert(site.homebrew_was_here)" }
       ensure
         probe_file.unlink if probe_file.exist?
       end
@@ -46,94 +63,92 @@ module Language
     end
 
     def self.in_sys_path?(python, path)
-      script = <<-EOS.undent
+      script = <<~PYTHON
         import os, sys
         [os.path.realpath(p) for p in sys.path].index(os.path.realpath("#{path}"))
-      EOS
+      PYTHON
       quiet_system python, "-c", script
     end
 
-    # deprecated; use system "python", *setup_install_args(prefix) instead
-    def self.setup_install(python, prefix, *args)
-      opoo <<-EOS.undent
-        Language::Python.setup_install is deprecated.
-        If you are a formula author, please use
-          system "python", *Language::Python.setup_install_args(prefix)
-        instead.
-      EOS
-
-      # force-import setuptools, which monkey-patches distutils, to make
-      # sure that we always call a setuptools setup.py. trick borrowed from pip:
-      # https://github.com/pypa/pip/blob/043af83/pip/req/req_install.py#L743-L780
-      shim = <<-EOS.undent
+    def self.setup_install_args(prefix, python = "python3")
+      shim = <<~PYTHON
         import setuptools, tokenize
         __file__ = 'setup.py'
         exec(compile(getattr(tokenize, 'open', open)(__file__).read()
           .replace('\\r\\n', '\\n'), __file__, 'exec'))
-      EOS
-      args += %w[--single-version-externally-managed --record=installed.txt]
-      args << "--prefix=#{prefix}"
-      system python, "-c", shim, "install", *args
-    end
-
-    def self.setup_install_args(prefix)
-      shim = <<-EOS.undent
-        import setuptools, tokenize
-        __file__ = 'setup.py'
-        exec(compile(getattr(tokenize, 'open', open)(__file__).read()
-          .replace('\\r\\n', '\\n'), __file__, 'exec'))
-      EOS
+      PYTHON
       %W[
         -c
         #{shim}
         --no-user-cfg
         install
         --prefix=#{prefix}
+        --install-scripts=#{prefix}/bin
+        --install-lib=#{prefix/site_packages(python)}
         --single-version-externally-managed
         --record=installed.txt
       ]
     end
 
-    def self.package_available?(python, module_name)
-      quiet_system python, "-c", "import #{module_name}"
+    # Mixin module for {Formula} adding shebang rewrite features.
+    module Shebang
+      module_function
+
+      # @private
+      def python_shebang_rewrite_info(python_path)
+        Utils::Shebang::RewriteInfo.new(
+          %r{^#! ?/usr/bin/(?:env )?python(?:[23](?:\.\d{1,2})?)?( |$)},
+          28, # the length of "#! /usr/bin/env pythonx.yyy "
+          "#{python_path}\\1",
+        )
+      end
+
+      def detected_python_shebang(formula = self)
+        python_deps = formula.deps.map(&:name).grep(/^python(@.*)?$/)
+
+        raise ShebangDetectionError.new("Python", "formula does not depend on Python") if python_deps.empty?
+        if python_deps.length > 1
+          raise ShebangDetectionError.new("Python", "formula has multiple Python dependencies")
+        end
+
+        python_shebang_rewrite_info(Formula[python_deps.first].opt_bin/"python3")
+      end
     end
 
     # Mixin module for {Formula} adding virtualenv support features.
     module Virtualenv
-      def self.included(base)
-        base.class_eval do
-          resource "homebrew-virtualenv" do
-            url PYTHON_VIRTUALENV_URL
-            sha256 PYTHON_VIRTUALENV_SHA256
-          end
-        end
-      end
+      extend T::Sig
 
       # Instantiates, creates, and yields a {Virtualenv} object for use from
-      # Formula#install, which provides helper methods for instantiating and
+      # {Formula#install}, which provides helper methods for instantiating and
       # installing packages into a Python virtualenv.
+      #
       # @param venv_root [Pathname, String] the path to the root of the virtualenv
       #   (often `libexec/"venv"`)
-      # @param python [String] which interpreter to use (e.g. "python"
-      #   or "python3")
-      # @param formula [Formula] the active Formula
+      # @param python [String] which interpreter to use (e.g. "python3"
+      #   or "python3.x")
+      # @param formula [Formula] the active {Formula}
       # @return [Virtualenv] a {Virtualenv} instance
-      def virtualenv_create(venv_root, python = "python", formula = self)
+      def virtualenv_create(venv_root, python = "python", formula = self, system_site_packages: true)
         ENV.refurbish_args
         venv = Virtualenv.new formula, venv_root, python
-        venv.create
+        venv.create(system_site_packages: system_site_packages)
 
         # Find any Python bindings provided by recursive dependencies
         formula_deps = formula.recursive_dependencies
-        xy = Language::Python.major_minor_version python
         pth_contents = formula_deps.map do |d|
-          next if d.build?
-          dep_site_packages = Formula[d.name].opt_lib/"python#{xy}/site-packages"
+          next if d.build? || d.test?
+          # Do not add the main site-package provided by the brewed
+          # Python formula, to keep the virtual-env's site-package pristine
+          next if python_names.include? d.name
+
+          dep_site_packages = Formula[d.name].opt_prefix/Language::Python.site_packages(python)
           next unless dep_site_packages.exist?
+
           "import site; site.addsitedir('#{dep_site_packages}')\n"
         end.compact
         unless pth_contents.empty?
-          (venv_root/"lib/python#{xy}/site-packages/homebrew_deps.pth").write pth_contents.join
+          (venv_root/Language::Python.site_packages(python)/"homebrew_deps.pth").write pth_contents.join
         end
 
         venv
@@ -141,34 +156,44 @@ module Language
 
       # Returns true if a formula option for the specified python is currently
       # active or if the specified python is required by the formula. Valid
-      # inputs are "python", "python3", :python, and :python3. Note that
-      # "with-python", "without-python", "with-python3", and "without-python3"
+      # inputs are "python", "python2", and :python3. Note that
+      # "with-python", "without-python", "with-python@2", and "without-python@2"
       # formula options are handled correctly even if not associated with any
       # corresponding depends_on statement.
+      #
       # @api private
       def needs_python?(python)
         return true if build.with?(python)
-        (requirements.to_a | deps).any? { |r| r.name == python && r.required? }
+
+        (requirements.to_a | deps).any? { |r| r.name.split("/").last == python && r.required? }
       end
 
       # Helper method for the common case of installing a Python application.
       # Creates a virtualenv in `libexec`, installs all `resource`s defined
       # on the formula, and then installs the formula. An options hash may be
-      # passed (e.g., :using => "python3") to override the default, guessed
-      # formula preference for python or python3, or to resolve an ambiguous
-      # case where it's not clear whether python or python3 should be the
+      # passed (e.g. `:using => "python"`) to override the default, guessed
+      # formula preference for python or python@x.y, or to resolve an ambiguous
+      # case where it's not clear whether python or python@x.y should be the
       # default guess.
-      def virtualenv_install_with_resources(options = {})
-        python = options[:using]
+      def virtualenv_install_with_resources(using: nil, system_site_packages: true)
+        python = using
         if python.nil?
-          wanted = %w[python python3].select { |py| needs_python?(py) }
+          wanted = python_names.select { |py| needs_python?(py) }
+          raise FormulaUnknownPythonError, self if wanted.empty?
           raise FormulaAmbiguousPythonError, self if wanted.size > 1
-          python = wanted.first || "python"
+
+          python = wanted.first
+          python = "python3" if python == "python"
         end
-        venv = virtualenv_create(libexec, python)
+        venv = virtualenv_create(libexec, python.delete("@"), system_site_packages: system_site_packages)
         venv.pip_install resources
         venv.pip_install_and_link buildpath
         venv
+      end
+
+      sig { returns(T::Array[String]) }
+      def python_names
+        %w[python python3 pypy pypy3] + Formula.names.select { |name| name.start_with? "python@" }
       end
 
       # Convenience wrapper for creating and installing packages into Python
@@ -176,57 +201,56 @@ module Language
       class Virtualenv
         # Initializes a Virtualenv instance. This does not create the virtualenv
         # on disk; {#create} does that.
-        # @param formula [Formula] the active Formula
+        #
+        # @param formula [Formula] the active {Formula}
         # @param venv_root [Pathname, String] the path to the root of the
         #   virtualenv
-        # @param python [String] which interpreter to use; i.e. "python" or
-        #   "python3"
+        # @param python [String] which interpreter to use, e.g. "python" or
+        #   "python2"
         def initialize(formula, venv_root, python)
           @formula = formula
           @venv_root = Pathname.new(venv_root)
           @python = python
         end
 
-        # Obtains a copy of the virtualenv library and creates a new virtualenv
-        # on disk.
+        # Obtains a copy of the virtualenv library and creates a new virtualenv on disk.
+        #
         # @return [void]
-        def create
+        def create(system_site_packages: true)
           return if (@venv_root/"bin/python").exist?
 
-          @formula.resource("homebrew-virtualenv").stage do |stage|
-            old_pythonpath = ENV.delete "PYTHONPATH"
-            begin
-              xy = Language::Python.major_minor_version(@python)
-              staging = Pathname.new(stage.staging.tmpdir)
-              ENV.prepend_create_path "PYTHONPATH", staging/"target/lib/python#{xy}/site-packages"
-              @formula.system @python, *Language::Python.setup_install_args(staging/"target")
-              @formula.system @python, "-s", staging/"target/bin/virtualenv", "-p", @python, @venv_root
-            ensure
-              ENV["PYTHONPATH"] = old_pythonpath
-            end
-          end
+          args = ["-m", "venv"]
+          args << "--system-site-packages" if system_site_packages
+          @formula.system @python, *args, @venv_root
 
-          # Robustify symlinks to survive python3 patch upgrades
+          # Robustify symlinks to survive python patch upgrades
           @venv_root.find do |f|
             next unless f.symlink?
             next unless (rp = f.realpath.to_s).start_with? HOMEBREW_CELLAR
-            python = rp.include?("python3") ? "python3" : "python"
-            new_target = rp.sub %r{#{HOMEBREW_CELLAR}/#{python}/[^/]+}, Formula[python].opt_prefix
+
+            version = rp.match %r{^#{HOMEBREW_CELLAR}/python@(.*?)/}o
+            version = "@#{version.captures.first}" unless version.nil?
+
+            new_target = rp.sub %r{#{HOMEBREW_CELLAR}/python#{version}/[^/]+}, Formula["python#{version}"].opt_prefix
             f.unlink
             f.make_symlink new_target
           end
 
           Pathname.glob(@venv_root/"lib/python*/orig-prefix.txt").each do |prefix_file|
             prefix_path = prefix_file.read
-            python = prefix_path.include?("python3") ? "python3" : "python"
-            prefix_path.sub! %r{^#{HOMEBREW_CELLAR}/#{python}/[^/]+}, Formula[python].opt_prefix
+
+            version = prefix_path.match %r{^#{HOMEBREW_CELLAR}/python@(.*?)/}o
+            version = "@#{version.captures.first}" unless version.nil?
+
+            prefix_path.sub! %r{^#{HOMEBREW_CELLAR}/python#{version}/[^/]+}, Formula["python#{version}"].opt_prefix
             prefix_file.atomic_write prefix_path
           end
         end
 
         # Installs packages represented by `targets` into the virtualenv.
+        #
         # @param targets [String, Pathname, Resource,
-        #   Array<String, Pathname, Resource>] (A) token(s) passed to pip
+        #   Array<String, Pathname, Resource>] (A) token(s) passed to `pip`
         #   representing the object to be installed. This can be a directory
         #   containing a setup.py, a {Resource} which will be staged and
         #   installed, or a package identifier to be fetched from PyPI.
@@ -234,20 +258,20 @@ module Language
         #   the contents of a `requirements.txt`.
         # @return [void]
         def pip_install(targets)
-          targets = [targets] unless targets.is_a? Array
+          targets = Array(targets)
           targets.each do |t|
             if t.respond_to? :stage
-              next if t.name == "homebrew-virtualenv"
               t.stage { do_install Pathname.pwd }
             else
-              t = t.lines.map(&:strip) if t.respond_to?(:lines) && t =~ /\n/
+              t = t.lines.map(&:strip) if t.respond_to?(:lines) && t.include?("\n")
               do_install t
             end
           end
         end
 
         # Installs packages represented by `targets` into the virtualenv, but
-        #   unlike {#pip_install} also links new scripts to {Formula#bin}.
+        # unlike {#pip_install} also links new scripts to {Formula#bin}.
+        #
         # @param (see #pip_install)
         # @return (see #pip_install)
         def pip_install_and_link(targets)
@@ -263,12 +287,12 @@ module Language
         private
 
         def do_install(targets)
-          targets = [targets] unless targets.is_a? Array
+          targets = Array(targets)
           @formula.system @venv_root/"bin/pip", "install",
                           "-v", "--no-deps", "--no-binary", ":all:",
                           "--ignore-installed", *targets
         end
-      end # class Virtualenv
-    end # module Virtualenv
-  end # module Python
-end # module Language
+      end
+    end
+  end
+end

@@ -1,158 +1,77 @@
-#:  * `uninstall`, `rm`, `remove` [`--force`] [`--ignore-dependencies`] <formula>:
-#:    Uninstall <formula>.
-#:
-#:    If `--force` is passed, and there are multiple versions of <formula>
-#:    installed, delete all installed versions.
-#:
-#:    If `--ignore-dependencies` is passed, uninstalling won't fail, even if
-#:    formulae depending on <formula> would still be installed.
+# typed: true
+# frozen_string_literal: true
 
 require "keg"
 require "formula"
 require "diagnostic"
 require "migrator"
+require "cli/parser"
+require "cask/cmd"
+require "cask/cask_loader"
+require "uninstall"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
+  sig { returns(CLI::Parser) }
+  def uninstall_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Uninstall a <formula> or <cask>.
+      EOS
+      switch "-f", "--force",
+             description: "Delete all installed versions of <formula>. Uninstall even if <cask> is not " \
+                          "installed, overwrite existing files and ignore errors when removing files."
+      switch "--zap",
+             description: "Remove all files associated with a <cask>. " \
+                          "*May remove files which are shared between applications.*"
+      switch "--ignore-dependencies",
+             description: "Don't fail uninstall, even if <formula> is a dependency of any installed " \
+                          "formulae."
+      switch "--formula", "--formulae",
+             description: "Treat all named arguments as formulae."
+      switch "--cask", "--casks",
+             description: "Treat all named arguments as casks."
+
+      conflicts "--formula", "--cask"
+      conflicts "--formula", "--zap"
+
+      named_args [:installed_formula, :installed_cask], min: 1
+    end
+  end
+
   def uninstall
-    raise KegUnspecifiedError if ARGV.named.empty?
+    args = uninstall_args.parse
 
-    kegs_by_rack = if ARGV.force?
-      Hash[ARGV.named.map do |name|
-        rack = Formulary.to_rack(name)
-        next unless rack.directory?
-        [rack, rack.subdirs.map { |d| Keg.new(d) }]
-      end]
+    all_kegs, casks = args.named.to_kegs_to_casks(
+      ignore_unavailable: args.force?,
+      all_kegs:           args.force?,
+    )
+
+    kegs_by_rack = all_kegs.group_by(&:rack)
+
+    Uninstall.uninstall_kegs(
+      kegs_by_rack,
+      casks:               casks,
+      force:               args.force?,
+      ignore_dependencies: args.ignore_dependencies?,
+      named_args:          args.named,
+    )
+
+    if args.zap?
+      T.unsafe(Cask::Cmd::Zap).zap_casks(
+        *casks,
+        verbose: args.verbose?,
+        force:   args.force?,
+      )
     else
-      ARGV.kegs.group_by(&:rack)
+      T.unsafe(Cask::Cmd::Uninstall).uninstall_casks(
+        *casks,
+        verbose: args.verbose?,
+        force:   args.force?,
+      )
     end
-
-    handle_unsatisfied_dependents(kegs_by_rack)
-    return if Homebrew.failed?
-
-    kegs_by_rack.each do |rack, kegs|
-      if ARGV.force?
-        name = rack.basename
-
-        if rack.directory?
-          puts "Uninstalling #{name}... (#{rack.abv})"
-          kegs.each do |keg|
-            keg.unlink
-            keg.uninstall
-          end
-        end
-
-        rm_pin rack
-      else
-        kegs.each do |keg|
-          keg.lock do
-            puts "Uninstalling #{keg}... (#{keg.abv})"
-            keg.unlink
-            keg.uninstall
-            rack = keg.rack
-            rm_pin rack
-
-            if rack.directory?
-              versions = rack.subdirs.map(&:basename)
-              verb = versions.length == 1 ? "is" : "are"
-              puts "#{keg.name} #{versions.join(", ")} #{verb} still installed."
-              puts "Remove all versions with `brew uninstall --force #{keg.name}`."
-            end
-          end
-        end
-      end
-    end
-  rescue MultipleVersionsInstalledError => e
-    ofail e
-    puts "Use `brew uninstall --force #{e.name}` to remove all versions."
-  ensure
-    # If we delete Cellar/newname, then Cellar/oldname symlink
-    # can become broken and we have to remove it.
-    if HOMEBREW_CELLAR.directory?
-      HOMEBREW_CELLAR.children.each do |rack|
-        rack.unlink if rack.symlink? && !rack.resolved_path_exists?
-      end
-    end
-  end
-
-  def handle_unsatisfied_dependents(kegs_by_rack)
-    return if ARGV.include?("--ignore-dependencies")
-
-    all_kegs = kegs_by_rack.values.flatten(1)
-    check_for_dependents all_kegs
-  rescue MethodDeprecatedError
-    # Silently ignore deprecations when uninstalling.
-    nil
-  end
-
-  def check_for_dependents(kegs)
-    return false unless result = Keg.find_some_installed_dependents(kegs)
-
-    if ARGV.homebrew_developer?
-      DeveloperDependentsMessage.new(*result).output
-    else
-      NondeveloperDependentsMessage.new(*result).output
-    end
-
-    true
-  end
-
-  class DependentsMessage
-    attr_reader :reqs, :deps
-
-    def initialize(requireds, dependents)
-      @reqs = requireds.compact
-      @deps = dependents.compact
-    end
-
-    protected
-
-    def are(items)
-      items.count == 1 ? "is" : "are"
-    end
-
-    def they(items)
-      items.count == 1 ? "it" : "they"
-    end
-
-    def list(items)
-      items.join(", ")
-    end
-
-    def sample_command
-      "brew uninstall --ignore-dependencies #{list reqs.map(&:name)}"
-    end
-
-    def are_required_by_deps
-      "#{are reqs} required by #{list deps}, which #{are deps} currently installed"
-    end
-  end
-
-  class DeveloperDependentsMessage < DependentsMessage
-    def output
-      opoo <<-EOS.undent
-        #{list reqs} #{are_required_by_deps}.
-        You can silence this warning with:
-          #{sample_command}
-      EOS
-    end
-  end
-
-  class NondeveloperDependentsMessage < DependentsMessage
-    def output
-      ofail <<-EOS.undent
-        Refusing to uninstall #{list reqs}
-        because #{they reqs} #{are_required_by_deps}.
-        You can override this and force removal with:
-          #{sample_command}
-      EOS
-    end
-  end
-
-  def rm_pin(rack)
-    Formulary.from_rack(rack).unpin
-  rescue
-    nil
   end
 end

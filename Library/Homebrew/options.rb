@@ -1,6 +1,12 @@
-require "set"
+# typed: false
+# frozen_string_literal: true
 
+# A formula option.
+#
+# @api private
 class Option
+  extend T::Sig
+
   attr_reader :name, :description, :flag
 
   def initialize(name, description = "")
@@ -15,6 +21,7 @@ class Option
 
   def <=>(other)
     return unless other.is_a?(Option)
+
     name <=> other.name
   end
 
@@ -27,12 +34,18 @@ class Option
     name.hash
   end
 
+  sig { returns(String) }
   def inspect
     "#<#{self.class.name}: #{flag.inspect}>"
   end
 end
 
+# A deprecated formula option.
+#
+# @api private
 class DeprecatedOption
+  extend T::Sig
+
   attr_reader :old, :current
 
   def initialize(old, current)
@@ -40,10 +53,12 @@ class DeprecatedOption
     @current = current
   end
 
+  sig { returns(String) }
   def old_flag
     "--#{old}"
   end
 
+  sig { returns(String) }
   def current_flag
     "--#{current}"
   end
@@ -54,11 +69,16 @@ class DeprecatedOption
   alias eql? ==
 end
 
+# A collection of formula options.
+#
+# @api private
 class Options
+  extend T::Sig
+
   include Enumerable
 
   def self.create(array)
-    new array.map { |e| Option.new(e[/^--([^=]+=?)(.+)?$/, 1] || e) }
+    new Array(array).map { |e| Option.new(e[/^--([^=]+=?)(.+)?$/, 1] || e) }
   end
 
   def initialize(*args)
@@ -69,30 +89,36 @@ class Options
     @options.each(*args, &block)
   end
 
-  def <<(o)
-    @options << o
+  def <<(other)
+    @options << other
     self
   end
 
-  def +(o)
-    self.class.new(@options + o)
+  def +(other)
+    self.class.new(@options + other)
   end
 
-  def -(o)
-    self.class.new(@options - o)
+  def -(other)
+    self.class.new(@options - other)
   end
 
-  def &(o)
-    self.class.new(@options & o)
+  def &(other)
+    self.class.new(@options & other)
   end
 
-  def |(o)
-    self.class.new(@options | o)
+  def |(other)
+    self.class.new(@options | other)
   end
 
-  def *(arg)
-    @options.to_a * arg
+  def *(other)
+    @options.to_a * other
   end
+
+  def ==(other)
+    instance_of?(other.class) &&
+      to_a == other.to_a
+  end
+  alias eql? ==
 
   def empty?
     @options.empty?
@@ -108,19 +134,15 @@ class Options
 
   alias to_ary to_a
 
+  sig { returns(String) }
   def inspect
     "#<#{self.class.name}: #{to_a.inspect}>"
   end
-end
 
-module Homebrew
-  module_function
-
-  def dump_options_for_formula(f)
+  def self.dump_for_formula(f)
     f.options.sort_by(&:flag).each do |opt|
       puts "#{opt.flag}\n\t#{opt.description}"
     end
-    puts "--devel\n\tInstall development version #{f.devel.version}" if f.devel
     puts "--HEAD\n\tInstall HEAD version" if f.head
   end
 end

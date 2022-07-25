@@ -1,48 +1,53 @@
-#:  * `analytics` [`state`]:
-#:    Display anonymous user behaviour analytics state.
-#:    Read more at <https://git.io/brew-analytics>.
-#:
-#:  * `analytics` (`on`|`off`):
-#:    Turn on/off Homebrew's analytics.
-#:
-#:  * `analytics` `regenerate-uuid`:
-#:    Regenerate UUID used in Homebrew's analytics.
+# typed: true
+# frozen_string_literal: true
+
+require "cli/parser"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
-  def analytics
-    config_file = HOMEBREW_REPOSITORY/".git/config"
+  sig { returns(CLI::Parser) }
+  def analytics_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Control Homebrew's anonymous aggregate user behaviour analytics.
+        Read more at <https://docs.brew.sh/Analytics>.
 
-    raise UsageError if ARGV.named.size > 1
-    case ARGV.named.first
+        `brew analytics` [`state`]:
+        Display the current state of Homebrew's analytics.
+
+        `brew analytics` (`on`|`off`):
+        Turn Homebrew's analytics on or off respectively.
+
+        `brew analytics regenerate-uuid`:
+        Regenerate the UUID used for Homebrew's analytics.
+      EOS
+
+      named_args %w[state on off regenerate-uuid], max: 1
+    end
+  end
+
+  def analytics
+    args = analytics_args.parse
+
+    case args.named.first
     when nil, "state"
-      analyticsdisabled = \
-        Utils.popen_read("git config --file=#{config_file} --get homebrew.analyticsdisabled").chuzzle
-      uuid = \
-        Utils.popen_read("git config --file=#{config_file} --get homebrew.analyticsuuid").chuzzle
-      if ENV["HOMEBREW_NO_ANALYTICS"]
-        puts "Analytics is disabled (by HOMEBREW_NO_ANALYTICS)."
-      elsif analyticsdisabled == "true"
-        puts "Analytics is disabled."
+      if Utils::Analytics.disabled?
+        puts "Analytics are disabled."
       else
-        puts "Analytics is enabled."
-        puts "UUID: #{uuid}" if uuid
+        puts "Analytics are enabled."
+        puts "UUID: #{Utils::Analytics.uuid}" if Utils::Analytics.uuid.present?
       end
     when "on"
-      safe_system "git", "config", "--file=#{config_file}",
-                                   "--replace-all", "homebrew.analyticsdisabled", "false"
-      safe_system "git", "config", "--file=#{config_file}",
-                                   "--replace-all", "homebrew.analyticsmessage", "true"
+      Utils::Analytics.enable!
     when "off"
-      safe_system "git", "config", "--file=#{config_file}",
-                                   "--replace-all", "homebrew.analyticsdisabled", "true"
-      system "git", "config", "--file=#{config_file}", "--unset-all", "homebrew.analyticsuuid"
+      Utils::Analytics.disable!
     when "regenerate-uuid"
-      # it will be regenerated in next run.
-      system "git", "config", "--file=#{config_file}", "--unset-all", "homebrew.analyticsuuid"
+      Utils::Analytics.regenerate_uuid!
     else
-      raise UsageError
+      raise UsageError, "unknown subcommand: #{args.named.first}"
     end
   end
 end

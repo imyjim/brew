@@ -1,28 +1,20 @@
-class Dependencies
-  include Enumerable
+# typed: false
+# frozen_string_literal: true
 
-  def initialize
-    @deps = []
+require "delegate"
+require "cask_dependent"
+
+# A collection of dependencies.
+#
+# @api private
+class Dependencies < SimpleDelegator
+  extend T::Sig
+
+  def initialize(*args)
+    super(args)
   end
 
-  def each(*args, &block)
-    @deps.each(*args, &block)
-  end
-
-  def <<(o)
-    @deps << o
-    self
-  end
-
-  def empty?
-    @deps.empty?
-  end
-
-  def *(arg)
-    @deps * arg
-  end
-
-  alias to_ary to_a
+  alias eql? ==
 
   def optional
     select(&:optional?)
@@ -44,40 +36,36 @@ class Dependencies
     build + required + recommended
   end
 
-  attr_reader :deps
-  protected :deps
-
-  def ==(other)
-    deps == other.deps
-  end
-  alias eql? ==
-
+  sig { returns(String) }
   def inspect
-    "#<#{self.class.name}: #{to_a.inspect}>"
+    "#<#{self.class.name}: #{to_a}>"
   end
 end
 
-class Requirements
-  include Enumerable
+# A collection of requirements.
+#
+# @api private
+class Requirements < SimpleDelegator
+  extend T::Sig
 
-  def initialize
-    @reqs = Set.new
-  end
-
-  def each(*args, &block)
-    @reqs.each(*args, &block)
+  def initialize(*args)
+    super(Set.new(args))
   end
 
   def <<(other)
     if other.is_a?(Comparable)
-      @reqs.grep(other.class) do |req|
+      grep(other.class) do |req|
         return self if req > other
-        @reqs.delete(req)
+
+        delete(req)
       end
     end
-    @reqs << other
+    super
     self
   end
 
-  alias to_ary to_a
+  sig { returns(String) }
+  def inspect
+    "#<#{self.class.name}: {#{to_a.join(", ")}}>"
+  end
 end

@@ -1,16 +1,30 @@
-#:  * `unpin` <formulae>:
-#:    Unpin <formulae>, allowing them to be upgraded by `brew upgrade`. See also
-#:    `pin`.
+# typed: true
+# frozen_string_literal: true
 
 require "formula"
+require "cli/parser"
 
 module Homebrew
+  extend T::Sig
+
   module_function
 
-  def unpin
-    raise FormulaUnspecifiedError if ARGV.named.empty?
+  sig { returns(CLI::Parser) }
+  def unpin_args
+    Homebrew::CLI::Parser.new do
+      description <<~EOS
+        Unpin <formula>, allowing them to be upgraded by `brew upgrade` <formula>.
+        See also `pin`.
+      EOS
 
-    ARGV.resolved_formulae.each do |f|
+      named_args :installed_formula, min: 1
+    end
+  end
+
+  def unpin
+    args = unpin_args.parse
+
+    args.named.to_resolved_formulae.each do |f|
       if f.pinned?
         f.unpin
       elsif !f.pinnable?
