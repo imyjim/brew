@@ -1,15 +1,25 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
 module RuboCop
   module Cask
     # Constants available globally for use in all cask cops.
     module Constants
+      ON_SYSTEM_METHODS = [:arm, :intel, *MacOSVersion::SYMBOLS.keys].map { |option| :"on_#{option}" }.freeze
+      ON_SYSTEM_METHODS_STANZA_ORDER = [
+        :arm,
+        :intel,
+        *MacOSVersion::SYMBOLS.reverse_each.to_h.keys, # Oldest OS blocks first since that's more common in Casks.
+      ].map { |option, _| :"on_#{option}" }.freeze
+
       STANZA_GROUPS = [
+        [:arch, :on_arch_conditional],
         [:version, :sha256],
+        ON_SYSTEM_METHODS_STANZA_ORDER,
         [:language],
         [:url, :appcast, :name, :desc, :homepage],
         [:livecheck],
+        [:deprecate!, :disable!],
         [
           :auto_updates,
           :conflicts_with,
@@ -28,6 +38,7 @@ module RuboCop
           :font,
           :input_method,
           :internet_plugin,
+          :keyboard_layout,
           :prefpane,
           :qlplugin,
           :mdimporter,
@@ -54,6 +65,20 @@ module RuboCop
         end.freeze
 
       STANZA_ORDER = STANZA_GROUPS.flatten.freeze
+
+      UNINSTALL_METHODS_ORDER = [
+        :early_script,
+        :launchctl,
+        :quit,
+        :signal,
+        :login_item,
+        :kext,
+        :script,
+        :pkgutil,
+        :delete,
+        :trash,
+        :rmdir,
+      ].freeze
     end
   end
 end

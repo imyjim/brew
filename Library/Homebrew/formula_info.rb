@@ -1,9 +1,7 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
 # Formula information drawn from an external `brew info --json` call.
-#
-# @api private
 class FormulaInfo
   # The whole info structure parsed from the JSON.
   attr_accessor :info
@@ -57,7 +55,7 @@ class FormulaInfo
 
   def version(spec_type)
     version_str = info["versions"][spec_type.to_s]
-    version_str && Version.create(version_str)
+    version_str && Version.new(version_str)
   end
 
   def pkg_version(spec_type = :stable)

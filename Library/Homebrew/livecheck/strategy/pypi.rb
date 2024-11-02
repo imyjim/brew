@@ -1,4 +1,4 @@
-# typed: true
+# typed: strict
 # frozen_string_literal: true
 
 module Homebrew
@@ -17,17 +17,15 @@ module Homebrew
       #
       # @api public
       class Pypi
-        extend T::Sig
-
         NICE_NAME = "PyPI"
 
-        # The `Regexp` used to extract the package name and suffix (e.g., file
+        # The `Regexp` used to extract the package name and suffix (e.g. file
         # extension) from the URL basename.
         FILENAME_REGEX = /
           (?<package_name>.+)- # The package name followed by a hyphen
           .*? # The version string
           (?<suffix>\.tar\.[a-z0-9]+|\.[a-z0-9]+)$ # Filename extension
-        /ix.freeze
+        /ix
 
         # The `Regexp` used to determine if the strategy applies to the URL.
         URL_MATCH_REGEX = %r{
@@ -35,7 +33,7 @@ module Homebrew
           /packages
           (?:/[^/]+)+ # The hexadecimal paths before the filename
           /#{FILENAME_REGEX.source.strip} # The filename
-        }ix.freeze
+        }ix
 
         # Whether the strategy can be applied to the provided URL.
         #
@@ -65,11 +63,11 @@ module Homebrew
           values[:url] = "https://pypi.org/project/#{T.must(match[:package_name]).gsub(/%20|_/, "-")}/#files"
 
           # Use `\.t` instead of specific tarball extensions (e.g. .tar.gz)
-          suffix = T.must(match[:suffix]).sub(Strategy::TARBALL_EXTENSION_REGEX, "\.t")
+          suffix = T.must(match[:suffix]).sub(Strategy::TARBALL_EXTENSION_REGEX, ".t")
           regex_suffix = Regexp.escape(suffix).gsub("\\-", "-")
 
           # Example regex: `%r{href=.*?/packages.*?/example[._-]v?(\d+(?:\.\d+)*(?:[._-]post\d+)?)\.t}i`
-          regex_name = Regexp.escape(T.must(match[:package_name])).gsub("\\-", "-")
+          regex_name = Regexp.escape(T.must(match[:package_name])).gsub(/\\[_-]/, "[_-]")
           values[:regex] =
             %r{href=.*?/packages.*?/#{regex_name}[._-]v?(\d+(?:\.\d+)*(?:[._-]post\d+)?)#{regex_suffix}}i
 
@@ -86,14 +84,14 @@ module Homebrew
           params(
             url:    String,
             regex:  T.nilable(Regexp),
-            unused: T.nilable(T::Hash[Symbol, T.untyped]),
-            block:  T.untyped,
+            unused: T.untyped,
+            block:  T.nilable(Proc),
           ).returns(T::Hash[Symbol, T.untyped])
         }
         def self.find_versions(url:, regex: nil, **unused, &block)
           generated = generate_input_values(url)
 
-          T.unsafe(PageMatch).find_versions(url: generated[:url], regex: regex || generated[:regex], **unused, &block)
+          PageMatch.find_versions(url: generated[:url], regex: regex || generated[:regex], **unused, &block)
         end
       end
     end

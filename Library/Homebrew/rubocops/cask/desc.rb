@@ -1,8 +1,6 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
-require "forwardable"
-require "uri"
 require "rubocops/cask/mixin/on_desc_stanza"
 require "rubocops/shared/desc_helper"
 

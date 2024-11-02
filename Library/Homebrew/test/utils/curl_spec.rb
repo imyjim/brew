@@ -1,10 +1,11 @@
-# typed: false
 # frozen_string_literal: true
 
 require "utils/curl"
 
-describe "Utils::Curl" do
-  let(:details) {
+RSpec.describe "Utils::Curl" do
+  include Utils::Curl
+
+  let(:details) do
     details = {
       normal:     {},
       cloudflare: {},
@@ -34,19 +35,19 @@ describe "Utils::Curl" do
       file_hash:      nil,
     }
 
-    details[:normal][:ok] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:normal][:ok] = details[:normal][:no_cookie].deep_dup
     details[:normal][:ok][:status_code] = "200"
 
-    details[:normal][:single_cookie] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:normal][:single_cookie] = details[:normal][:no_cookie].deep_dup
     details[:normal][:single_cookie][:headers]["set-cookie"] = "a_cookie=for_testing"
 
-    details[:normal][:multiple_cookies] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:normal][:multiple_cookies] = details[:normal][:no_cookie].deep_dup
     details[:normal][:multiple_cookies][:headers]["set-cookie"] = [
       "first_cookie=for_testing",
       "last_cookie=also_for_testing",
     ]
 
-    details[:normal][:blank_headers] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:normal][:blank_headers] = details[:normal][:no_cookie].deep_dup
     details[:normal][:blank_headers][:headers] = {}
 
     details[:cloudflare][:single_cookie] = {
@@ -74,7 +75,7 @@ describe "Utils::Curl" do
       file_hash:      nil,
     }
 
-    details[:cloudflare][:multiple_cookies] = Marshal.load(Marshal.dump(details[:cloudflare][:single_cookie]))
+    details[:cloudflare][:multiple_cookies] = details[:cloudflare][:single_cookie].deep_dup
     details[:cloudflare][:multiple_cookies][:headers]["set-cookie"] = [
       "first_cookie=for_testing",
       "__cf_bm=abcdef0123456789; path=/; expires=Thu, 28-Apr-22 18:38:40 GMT; domain=www.example.com; HttpOnly; " \
@@ -82,28 +83,28 @@ describe "Utils::Curl" do
       "last_cookie=also_for_testing",
     ]
 
-    details[:cloudflare][:no_server] = Marshal.load(Marshal.dump(details[:cloudflare][:single_cookie]))
+    details[:cloudflare][:no_server] = details[:cloudflare][:single_cookie].deep_dup
     details[:cloudflare][:no_server][:headers].delete("server")
 
-    details[:cloudflare][:wrong_server] = Marshal.load(Marshal.dump(details[:cloudflare][:single_cookie]))
+    details[:cloudflare][:wrong_server] = details[:cloudflare][:single_cookie].deep_dup
     details[:cloudflare][:wrong_server][:headers]["server"] = "nginx 1.2.3"
 
     # TODO: Make the Incapsula test data more realistic once we can find an
     # example website to reference.
-    details[:incapsula][:single_cookie_visid_incap] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:incapsula][:single_cookie_visid_incap] = details[:normal][:no_cookie].deep_dup
     details[:incapsula][:single_cookie_visid_incap][:headers]["set-cookie"] = "visid_incap_something=something"
 
-    details[:incapsula][:single_cookie_incap_ses] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:incapsula][:single_cookie_incap_ses] = details[:normal][:no_cookie].deep_dup
     details[:incapsula][:single_cookie_incap_ses][:headers]["set-cookie"] = "incap_ses_something=something"
 
-    details[:incapsula][:multiple_cookies_visid_incap] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:incapsula][:multiple_cookies_visid_incap] = details[:normal][:no_cookie].deep_dup
     details[:incapsula][:multiple_cookies_visid_incap][:headers]["set-cookie"] = [
       "first_cookie=for_testing",
       "visid_incap_something=something",
       "last_cookie=also_for_testing",
     ]
 
-    details[:incapsula][:multiple_cookies_incap_ses] = Marshal.load(Marshal.dump(details[:normal][:no_cookie]))
+    details[:incapsula][:multiple_cookies_incap_ses] = details[:normal][:no_cookie].deep_dup
     details[:incapsula][:multiple_cookies_incap_ses][:headers]["set-cookie"] = [
       "first_cookie=for_testing",
       "incap_ses_something=something",
@@ -111,17 +112,17 @@ describe "Utils::Curl" do
     ]
 
     details
-  }
+  end
 
-  let(:location_urls) {
+  let(:location_urls) do
     %w[
       https://example.com/example/
       https://example.com/example1/
       https://example.com/example2/
     ]
-  }
+  end
 
-  let(:response_hash) {
+  let(:response_hash) do
     response_hash = {}
 
     response_hash[:ok] = {
@@ -240,9 +241,9 @@ describe "Utils::Curl" do
     }
 
     response_hash
-  }
+  end
 
-  let(:response_text) {
+  let(:response_text) do
     response_text = {}
 
     response_text[:ok] = <<~EOS
@@ -279,9 +280,9 @@ describe "Utils::Curl" do
     )
 
     response_text
-  }
+  end
 
-  let(:body) {
+  let(:body) do
     body = {}
 
     body[:default] = <<~EOS
@@ -303,7 +304,7 @@ describe "Utils::Curl" do
     body[:with_http_status_line] = body[:default].sub("<html>", "HTTP/1.1 200\r\n<html>")
 
     body
-  }
+  end
 
   describe "curl_args" do
     let(:args) { ["foo"] }
@@ -314,9 +315,25 @@ describe "Utils::Curl" do
       expect(curl_args(*args).first).to eq("--disable")
     end
 
-    it "doesn't return `--disable` as the first argument when HOMEBREW_CURLRC is set" do
+    it "doesn't return `--disable` as the first argument when HOMEBREW_CURLRC is set but not a path" do
       ENV["HOMEBREW_CURLRC"] = "1"
       expect(curl_args(*args).first).not_to eq("--disable")
+    end
+
+    it "doesn't return `--config` when HOMEBREW_CURLRC is unset" do
+      expect(curl_args(*args)).not_to include(a_string_starting_with("--config"))
+    end
+
+    it "returns `--config` when HOMEBREW_CURLRC is a valid path" do
+      Tempfile.create do |tmpfile|
+        path = tmpfile.path
+        ENV["HOMEBREW_CURLRC"] = path
+        # We still expect --disable
+        expect(curl_args(*args).first).to eq("--disable")
+        expect(curl_args(*args).join(" ")).to include("--config #{path}")
+      end
+    ensure
+      ENV["HOMEBREW_CURLRC"] = nil
     end
 
     it "uses `--connect-timeout` when `:connect_timeout` is Numeric" do
@@ -369,6 +386,14 @@ describe "Utils::Curl" do
 
     it "errors when `:retry_max_time` is not Numeric" do
       expect { curl_args(*args, retry_max_time: "test") }.to raise_error(TypeError)
+    end
+
+    it "uses `--referer` when :referer is present" do
+      expect(curl_args(*args, referer: "https://brew.sh").join(" ")).to include("--referer https://brew.sh")
+    end
+
+    it "doesn't use `--referer` when :referer is nil" do
+      expect(curl_args(*args, referer: nil).join(" ")).not_to include("--referer")
     end
 
     it "uses HOMEBREW_USER_AGENT_FAKE_SAFARI when `:user_agent` is `:browser` or `:fake`" do
@@ -554,6 +579,60 @@ describe "Utils::Curl" do
 
     it "returns nil when the response hash doesn't contain a location header" do
       expect(curl_response_last_location([response_hash[:ok]])).to be_nil
+    end
+  end
+
+  describe "#curl_response_follow_redirections" do
+    it "returns the original URL when there are no location headers" do
+      expect(
+        curl_response_follow_redirections(
+          [response_hash[:ok]],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq("https://brew.sh/test1/test2")
+    end
+
+    it "returns the URL relative to base when locations are relative" do
+      expect(
+        curl_response_follow_redirections(
+          [response_hash[:redirection_root_relative], response_hash[:ok]],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq("https://brew.sh/example/")
+
+      expect(
+        curl_response_follow_redirections(
+          [response_hash[:redirection_parent_relative], response_hash[:ok]],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq("https://brew.sh/test1/example/")
+
+      expect(
+        curl_response_follow_redirections(
+          [
+            response_hash[:redirection_parent_relative],
+            response_hash[:redirection_parent_relative],
+            response_hash[:ok],
+          ],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq("https://brew.sh/test1/example/example/")
+    end
+
+    it "returns new base when there are absolute location(s)" do
+      expect(
+        curl_response_follow_redirections(
+          [response_hash[:redirection], response_hash[:ok]],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq(location_urls[0])
+
+      expect(
+        curl_response_follow_redirections(
+          [response_hash[:redirection], response_hash[:redirection_parent_relative], response_hash[:ok]],
+          "https://brew.sh/test1/test2",
+        ),
+      ).to eq("#{location_urls[0]}example/")
     end
   end
 end

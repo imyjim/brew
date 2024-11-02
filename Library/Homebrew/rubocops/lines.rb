@@ -1,17 +1,17 @@
-# typed: true
+# typed: true # rubocop:todo Sorbet/StrictSigil
 # frozen_string_literal: true
 
-require "macos_versions"
-require "rubocops/extend/formula"
+require "macos_version"
+require "rubocops/extend/formula_cop"
+require "rubocops/shared/on_system_conditionals_helper"
 
 module RuboCop
   module Cop
     module FormulaAudit
       # This cop checks for various miscellaneous Homebrew coding styles.
-      #
-      # @api private
       class Lines < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, _body_node)
+        sig { override.params(_formula_nodes: FormulaNodes).void }
+        def audit_formula(_formula_nodes)
           [:automake, :ant, :autoconf, :emacs, :expat, :libtool, :mysql, :perl,
            :postgresql, :python, :python3, :rbenv, :ruby].each do |dependency|
             next unless depends_on?(dependency)
@@ -31,13 +31,13 @@ module RuboCop
       end
 
       # This cop makes sure that a space is used for class inheritance.
-      #
-      # @api private
       class ClassInheritance < FormulaCop
-        def audit_formula(_node, class_node, parent_class_node, _body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          parent_class_node = formula_nodes.parent_class_node
           begin_pos = start_column(parent_class_node)
-          end_pos = end_column(class_node)
-          return unless begin_pos-end_pos != 3
+          end_pos = end_column(formula_nodes.class_node)
+          return if begin_pos-end_pos == 3
 
           problem "Use a space in class inheritance: " \
                   "class #{@formula_name.capitalize} < #{class_name(parent_class_node)}"
@@ -45,10 +45,9 @@ module RuboCop
       end
 
       # This cop makes sure that template comments are removed.
-      #
-      # @api private
       class Comments < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, _body_node)
+        sig { override.params(_formula_nodes: FormulaNodes).void }
+        def audit_formula(_formula_nodes)
           audit_comments do |comment|
             [
               "# PLEASE REMOVE",
@@ -86,10 +85,11 @@ module RuboCop
       end
 
       # This cop makes sure that idiomatic `assert_*` statements are used.
-      #
-      # @api private
       class AssertStatements < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           find_every_method_call_by_name(body_node, :assert).each do |method|
             if method_called_ever?(method, :include?) && !method_called_ever?(method, :!)
               problem "Use `assert_match` instead of `assert ...include?`"
@@ -111,10 +111,11 @@ module RuboCop
       end
 
       # This cop makes sure that `option`s are used idiomatically.
-      #
-      # @api private
       class OptionDeclarations < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           problem "Use new-style option definitions" if find_method_def(body_node, :options)
 
           if formula_tap == "homebrew-core"
@@ -194,14 +195,15 @@ module RuboCop
       end
 
       # This cop makes sure that formulae depend on `open-mpi` instead of `mpich`.
-      #
-      # @api private
       class MpiCheck < FormulaCop
         extend AutoCorrector
 
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           # Enforce use of OpenMPI for MPI dependency in core
-          return unless formula_tap == "homebrew-core"
+          return if formula_tap != "homebrew-core"
 
           find_method_with_args(body_node, :depends_on, "mpich") do
             problem "Formulae in homebrew/core should use 'depends_on \"open-mpi\"' " \
@@ -212,39 +214,85 @@ module RuboCop
         end
       end
 
-      # This cop makes sure that formulae do not depend on `pyoxidizer` at build-time
-      # or run-time.
-      #
-      # @api private
-      class PyoxidizerCheck < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
-          # Disallow use of PyOxidizer as a dependency in core
-          return unless formula_tap == "homebrew-core"
+      # This cop makes sure that formulae use `std_npm_args` instead of older
+      # `local_npm_install_args` and `std_npm_install_args`.
+      class StdNpmArgs < FormulaCop
+        extend AutoCorrector
 
-          find_method_with_args(body_node, :depends_on, "pyoxidizer") do
-            problem "Formulae in homebrew/core should not use '#{@offensive_node.source}'."
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
+          find_method_with_args(body_node, :local_npm_install_args) do
+            problem "Use 'std_npm_args' instead of '#{@offensive_node.method_name}'." do |corrector|
+              corrector.replace(@offensive_node.source_range, "std_npm_args(prefix: false)")
+            end
           end
 
-          [
-            :build,
-            [:build],
-            [:build, :test],
-            [:test, :build],
-          ].each do |type|
-            find_method_with_args(body_node, :depends_on, "pyoxidizer" => type) do
-              problem "Formulae in homebrew/core should not use '#{@offensive_node.source}'."
+          find_method_with_args(body_node, :std_npm_install_args) do |method|
+            problem "Use 'std_npm_args' instead of '#{@offensive_node.method_name}'." do |corrector|
+              if (param = parameters(method).first.source) == "libexec"
+                corrector.replace(@offensive_node.source_range, "std_npm_args")
+              else
+                corrector.replace(@offensive_node.source_range, "std_npm_args(prefix: #{param})")
+              end
+            end
+          end
+
+          find_every_method_call_by_name(body_node, :system).each do |method|
+            first_param, second_param = parameters(method)
+            next if !node_equals?(first_param, "npm") ||
+                    !node_equals?(second_param, "install") ||
+                    method.source.match(/(std_npm_args|local_npm_install_args|std_npm_install_args)/)
+
+            offending_node(method)
+            problem "Use `std_npm_args` for npm install"
+          end
+        end
+      end
+
+      # This cop makes sure that formulae depend on `openssl` instead of `quictls`.
+      class QuicTLSCheck < FormulaCop
+        extend AutoCorrector
+
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
+          # Enforce use of OpenSSL for TLS dependency in core
+          return if formula_tap != "homebrew-core"
+
+          find_method_with_args(body_node, :depends_on, "quictls") do
+            problem "Formulae in homebrew/core should use 'depends_on \"openssl@3\"' " \
+                    "instead of '#{@offensive_node.source}'." do |corrector|
+              corrector.replace(@offensive_node.source_range, "depends_on \"openssl@3\"")
             end
           end
         end
       end
 
+      # This cop makes sure that formulae do not depend on `pyoxidizer` at build-time
+      # or run-time.
+      class PyoxidizerCheck < FormulaCop
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if formula_nodes.body_node.nil?
+          # Disallow use of PyOxidizer as a dependency in core
+          return if formula_tap != "homebrew-core"
+          return unless depends_on?("pyoxidizer")
+
+          problem "Formulae in homebrew/core should not use '#{@offensive_node.source}'."
+        end
+      end
+
       # This cop makes sure that the safe versions of `popen_*` calls are used.
-      #
-      # @api private
       class SafePopenCommands < FormulaCop
         extend AutoCorrector
 
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           test = find_block(body_node, :test)
 
           [:popen_read, :popen_write].each do |unsafe_command|
@@ -268,12 +316,13 @@ module RuboCop
       end
 
       # This cop makes sure that environment variables are passed correctly to `popen_*` calls.
-      #
-      # @api private
       class ShellVariables < FormulaCop
         extend AutoCorrector
 
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           popen_commands = [
             :popen,
             :popen_read,
@@ -289,8 +338,7 @@ module RuboCop
               good_args = "Utils.#{command}({ \"#{match[1]}\" => \"#{match[2]}\" }, \"#{match[3]}\")"
 
               problem "Use `#{good_args}` instead of `#{method.source}`" do |corrector|
-                corrector.replace(@offensive_node.source_range,
-                                  "{ \"#{match[1]}\" => \"#{match[2]}\" }, \"#{match[3]}\"")
+                corrector.replace(method.source_range, good_args)
               end
             end
           end
@@ -298,12 +346,13 @@ module RuboCop
       end
 
       # This cop makes sure that `license` has the correct format.
-      #
-      # @api private
       class LicenseArrays < FormulaCop
         extend AutoCorrector
 
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           license_node = find_node_method_by_name(body_node, :license)
           return unless license_node
 
@@ -317,10 +366,11 @@ module RuboCop
       end
 
       # This cop makes sure that nested `license` declarations are split onto multiple lines.
-      #
-      # @api private
       class Licenses < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           license_node = find_node_method_by_name(body_node, :license)
           return unless license_node
           return if license_node.source.include?("\n")
@@ -338,19 +388,28 @@ module RuboCop
       end
 
       # This cop makes sure that Python versions are consistent.
-      #
-      # @api private
       class PythonVersions < FormulaCop
         extend AutoCorrector
 
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           python_formula_node = find_every_method_call_by_name(body_node, :depends_on).find do |dep|
             string_content(parameters(dep).first).start_with? "python@"
           end
 
-          return if python_formula_node.blank?
+          python_version = if python_formula_node.blank?
+            other_python_nodes = find_every_method_call_by_name(body_node, :depends_on).select do |dep|
+              parameters(dep).first.instance_of?(RuboCop::AST::HashNode) &&
+                string_content(parameters(dep).first.keys.first).start_with?("python@")
+            end
+            return if other_python_nodes.size != 1
 
-          python_version = string_content(parameters(python_formula_node).first).split("@").last
+            string_content(parameters(other_python_nodes.first).first.keys.first).split("@").last
+          else
+            string_content(parameters(python_formula_node).first).split("@").last
+          end
 
           find_strings(body_node).each do |str|
             content = string_content(str)
@@ -374,107 +433,24 @@ module RuboCop
       end
 
       # This cop makes sure that OS conditionals are consistent.
-      #
-      # @api private
       class OnSystemConditionals < FormulaCop
+        include OnSystemConditionalsHelper
         extend AutoCorrector
 
         NO_ON_SYSTEM_METHOD_NAMES = [:install, :post_install].freeze
         NO_ON_SYSTEM_BLOCK_NAMES = [:service, :test].freeze
 
-        ON_ARCH_OPTIONS = [:intel, :arm].freeze
-        ON_BASE_OS_OPTIONS = [:macos, :linux].freeze
-        ON_MACOS_VERSION_OPTIONS = MacOSVersions::SYMBOLS.keys.freeze
-        ALL_SYSTEM_OPTIONS = [*ON_ARCH_OPTIONS, *ON_BASE_OS_OPTIONS, *ON_MACOS_VERSION_OPTIONS, :system].freeze
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          body_node = formula_nodes.body_node
 
-        MACOS_VERSION_CONDITIONALS = {
-          "==" => nil,
-          "<=" => :or_older,
-          ">=" => :or_newer,
-        }.freeze
-
-        ON_SYSTEM_CONDITIONALS = [:<, :<=].freeze
-
-        def on_system_method_info(on_system_option)
-          info = {}
-          info[:method] = :"on_#{on_system_option}"
-          info[:if_module], info[:if_method] = if ON_ARCH_OPTIONS.include?(on_system_option)
-            ["Hardware::CPU", :"#{on_system_option}?"]
-          elsif ON_BASE_OS_OPTIONS.include?(on_system_option)
-            ["OS", on_system_option == :macos ? :mac? : :linux?]
-          else
-            ["MacOS", :version]
-          end
-          info[:on_system_string] = "on_#{on_system_option}"
-          info[:if_string] = if on_system_option == :system
-            "if OS.linux? || MacOS.version"
-          else
-            "if #{info[:if_module]}.#{info[:if_method]}"
-          end
-
-          info
-        end
-
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
-          top_level_nodes_to_check = []
           NO_ON_SYSTEM_METHOD_NAMES.each do |formula_method_name|
             method_node = find_method_def(body_node, formula_method_name)
-            top_level_nodes_to_check << [formula_method_name, method_node] if method_node
+            audit_on_system_blocks(method_node, formula_method_name) if method_node
           end
           NO_ON_SYSTEM_BLOCK_NAMES.each do |formula_block_name|
             block_node = find_block(body_node, formula_block_name)
-            top_level_nodes_to_check << [formula_block_name, block_node] if block_node
-          end
-
-          ALL_SYSTEM_OPTIONS.each do |on_system_option|
-            method_info = on_system_method_info(on_system_option)
-
-            top_level_nodes_to_check.each do |top_level_name, top_level_node|
-              top_level_node_string = if top_level_node.def_type?
-                "def #{top_level_name}"
-              else
-                "#{top_level_name} do"
-              end
-
-              find_every_method_call_by_name(top_level_node, method_info[:method]).each do |method|
-                if ON_MACOS_VERSION_OPTIONS.include?(on_system_option)
-                  on_macos_version_method_call(method, on_method: method_info[:method]) do |on_method_parameters|
-                    if on_method_parameters.empty?
-                      method_info[:if_string] = "if MacOS.version == :#{on_system_option}"
-                    else
-                      method_info[:on_system_string] = "#{method_info[:method]} :#{on_method_parameters.first}"
-                      if_condition_operator = MACOS_VERSION_CONDITIONALS.key(on_method_parameters.first)
-                      method_info[:if_string] = "if MacOS.version #{if_condition_operator} :#{on_system_option}"
-                    end
-                  end
-                elsif method_info[:method] == :on_system
-                  on_system_method_call(method) do |macos_symbol|
-                    base_os, condition = macos_symbol.to_s.split(/_(?=or_)/).map(&:to_sym)
-                    method_info[:on_system_string] = if condition.present?
-                      "on_system :linux, macos: :#{base_os}_#{condition}"
-                    else
-                      "on_system :linux, macos: :#{base_os}"
-                    end
-                    if_condition_operator = MACOS_VERSION_CONDITIONALS.key(condition)
-                    method_info[:if_string] = "if OS.linux? || MacOS.version #{if_condition_operator} :#{base_os}"
-                  end
-                end
-
-                offending_node(method)
-
-                problem "Don't use `#{method_info[:on_system_string]}` in `#{top_level_node_string}`, " \
-                        "use `#{method_info[:if_string]}` instead." do |corrector|
-                  block_node = offending_node.parent
-                  next if block_node.type != :block
-
-                  # TODO: could fix corrector to handle this but punting for now.
-                  next if block_node.single_line?
-
-                  source_range = offending_node.source_range.join(offending_node.parent.loc.begin)
-                  corrector.replace(source_range, method_info[:if_string])
-                end
-              end
-            end
+            audit_on_system_blocks(block_node, formula_block_name) if block_node
           end
 
           # Don't restrict OS.mac? or OS.linux? usage in taps; they don't care
@@ -483,122 +459,184 @@ module RuboCop
           # that case.
           return if formula_tap != "homebrew-core"
 
-          ALL_SYSTEM_OPTIONS.each do |on_system_option|
-            method_info = on_system_method_info(on_system_option)
+          audit_arch_conditionals(body_node,
+                                  allowed_methods: NO_ON_SYSTEM_METHOD_NAMES,
+                                  allowed_blocks:  NO_ON_SYSTEM_BLOCK_NAMES)
 
-            if_nodes_to_check = []
+          audit_base_os_conditionals(body_node,
+                                     allowed_methods: NO_ON_SYSTEM_METHOD_NAMES,
+                                     allowed_blocks:  NO_ON_SYSTEM_BLOCK_NAMES)
 
-            if ON_ARCH_OPTIONS.include?(on_system_option)
-              if_arch_node_search(body_node, arch: method_info[:if_method]) do |if_node, else_node|
-                else_info = if else_node.present?
-                  {
-                    can_autocorrect:  true,
-                    on_system_method: on_system_option == :intel ? "on_arm" : "on_intel",
-                    node:             else_node,
-                  }
-                end
+          audit_macos_version_conditionals(body_node,
+                                           allowed_methods:     NO_ON_SYSTEM_METHOD_NAMES,
+                                           allowed_blocks:      NO_ON_SYSTEM_BLOCK_NAMES,
+                                           recommend_on_system: true)
+        end
+      end
 
-                if_nodes_to_check << [if_node, else_info]
-              end
-            elsif ON_BASE_OS_OPTIONS.include?(on_system_option)
-              if_base_os_node_search(body_node, base_os: method_info[:if_method]) do |if_node, else_node|
-                else_info = if else_node.present?
-                  {
-                    can_autocorrect:  true,
-                    on_system_method: on_system_option == :macos ? "on_linux" : "on_macos",
-                    node:             else_node,
-                  }
-                end
+      # This cop makes sure the `MacOS` module is not used in Linux-facing formula code
+      class MacOSOnLinux < FormulaCop
+        include OnSystemConditionalsHelper
 
-                if_nodes_to_check << [if_node, else_info]
-              end
+        ON_MACOS_BLOCKS = [:macos, *MACOS_VERSION_OPTIONS].map { |os| :"on_#{os}" }.freeze
+
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          audit_macos_references(formula_nodes.body_node,
+                                 allowed_methods: OnSystemConditionals::NO_ON_SYSTEM_METHOD_NAMES,
+                                 allowed_blocks:  OnSystemConditionals::NO_ON_SYSTEM_BLOCK_NAMES + ON_MACOS_BLOCKS)
+        end
+      end
+
+      # This cop makes sure that the `generate_completions_from_executable` DSL is used.
+      class GenerateCompletionsDSL < FormulaCop
+        extend AutoCorrector
+
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          install = find_method_def(formula_nodes.body_node, :install)
+          return if install.blank?
+
+          correctable_shell_completion_node(install) do |node, shell, base_name, executable, subcmd, shell_parameter|
+            # generate_completions_from_executable only applicable if shell is passed
+            next unless shell_parameter.match?(/(bash|zsh|fish)/)
+
+            base_name = base_name.delete_prefix("_").delete_suffix(".fish")
+            shell = shell.to_s.delete_suffix("_completion").to_sym
+            shell_parameter_stripped = shell_parameter
+                                       .delete_suffix("bash")
+                                       .delete_suffix("zsh")
+                                       .delete_suffix("fish")
+            shell_parameter_format = if shell_parameter_stripped.empty?
+              nil
+            elsif shell_parameter_stripped == "--"
+              :flag
+            elsif shell_parameter_stripped == "--shell="
+              :arg
             else
-              if_macos_version_node_search(body_node, os_name: on_system_option) do |if_node, operator, else_node|
-                if operator == :<
-                  method_info[:on_system_string] = "on_system"
-                elsif operator == :<=
-                  method_info[:on_system_string] = "on_system :linux, macos: :#{on_system_option}_or_older"
-                elsif operator != :== && MACOS_VERSION_CONDITIONALS.key?(operator.to_s)
-                  method_info[:on_system_string] = "#{method_info[:method]} " \
-                                                   ":#{MACOS_VERSION_CONDITIONALS[operator.to_s]}"
-                end
-                method_info[:if_string] = "if #{method_info[:if_module]}.#{method_info[:if_method]} #{operator} " \
-                                          ":#{on_system_option}"
-                if else_node.present? || !MACOS_VERSION_CONDITIONALS.key?(operator.to_s)
-                  else_info = { can_autocorrect: false }
-                end
-
-                if_nodes_to_check << [if_node, else_info]
-              end
+              shell_parameter_stripped
             end
 
-            if_nodes_to_check.each do |if_node, else_info|
-              # TODO: check to see if it's legal
-              valid = T.let(false, T::Boolean)
-              if_node.each_ancestor do |ancestor|
-                valid_method_names = case ancestor.type
-                when :def
-                  NO_ON_SYSTEM_METHOD_NAMES
-                when :block
-                  NO_ON_SYSTEM_BLOCK_NAMES
-                else
-                  next
-                end
-                next unless valid_method_names.include?(ancestor.method_name)
-
-                valid = true
-                break
-              end
-              next if valid
-
-              offending_node(if_node)
-
-              problem "Don't use `#{method_info[:if_string]}`, " \
-                      "use `#{method_info[:on_system_string]} do` instead." do |corrector|
-                # TODO: could fix corrector to handle this but punting for now.
-                next if if_node.unless?
-
-                if else_info.present?
-                  next unless else_info[:can_autocorrect]
-
-                  corrector.replace(if_node.source_range,
-                                    "#{method_info[:on_system_string]} do\n#{if_node.body.source}\nend\n" \
-                                    "#{else_info[:on_system_method]} do\n#{else_info[:node].source}\nend")
-                else
-                  corrector.replace(if_node.source_range,
-                                    "#{method_info[:on_system_string]} do\n#{if_node.body.source}\nend")
-                end
-              end
+            replacement_args = %w[]
+            replacement_args << executable.source
+            replacement_args << subcmd.source
+            replacement_args << "base_name: \"#{base_name}\"" if base_name != @formula_name
+            replacement_args << "shells: [:#{shell}]"
+            unless shell_parameter_format.nil?
+              replacement_args << "shell_parameter_format: #{shell_parameter_format.inspect}"
             end
+
+            offending_node(node)
+            replacement = "generate_completions_from_executable(#{replacement_args.join(", ")})"
+
+            problem "Use `#{replacement}` instead of `#{@offensive_node.source}`." do |corrector|
+              corrector.replace(@offensive_node.source_range, replacement)
+            end
+          end
+
+          shell_completion_node(install) do |node|
+            next if node.source.include?("<<~") # skip heredoc completion scripts
+            next if node.source.match?(/{.*=>.*}/) # skip commands needing custom ENV variables
+
+            offending_node(node)
+            problem "Use `generate_completions_from_executable` DSL instead of `#{@offensive_node.source}`."
           end
         end
 
-        def_node_matcher :on_macos_version_method_call, <<~PATTERN
-          (send nil? %on_method (sym ${:or_newer :or_older})?)
-        PATTERN
+        # match ({bash,zsh,fish}_completion/"_?foo{.fish}?").write Utils.safe_popen_read(foo, subcmd, shell_parameter)
+        def_node_search :correctable_shell_completion_node, <<~EOS
+          $(send
+          (begin
+            (send
+              (send nil? ${:bash_completion :zsh_completion :fish_completion}) :/
+              (str $_))) :write
+          (send
+            (const nil? :Utils) :safe_popen_read
+            $(send
+              (send nil? :bin) :/
+              (str _))
+            $(str _)
+            (str $_)))
+        EOS
 
-        def_node_matcher :on_system_method_call, <<~PATTERN
-          (send nil? :on_system (sym :linux) (hash (pair (sym :macos) (sym $_))))
-        PATTERN
+        # matches ({bash,zsh,fish}_completion/"_?foo{.fish}?").write output
+        def_node_search :shell_completion_node, <<~EOS
+          $(send
+            (begin
+              (send
+                (send nil? {:bash_completion :zsh_completion :fish_completion}) :/
+                (str _))) :write _)
+        EOS
+      end
 
-        def_node_search :if_arch_node_search, <<~PATTERN
-          $(if (send (const (const nil? :Hardware) :CPU) %arch) _ $_)
-        PATTERN
+      # This cop makes sure that the `generate_completions_from_executable` DSL is used with only
+      # a single, combined call for all shells.
+      class SingleGenerateCompletionsDSLCall < FormulaCop
+        extend AutoCorrector
 
-        def_node_search :if_base_os_node_search, <<~PATTERN
-          $(if (send (const nil? :OS) %base_os) _ $_)
-        PATTERN
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          install = find_method_def(formula_nodes.body_node, :install)
+          return if install.blank?
 
-        def_node_search :if_macos_version_node_search, <<~PATTERN
-          $(if (send (send (const nil? :MacOS) :version) ${:== :<= :< :>= :> :!=} (sym %os_name)) _ $_)
-        PATTERN
+          methods = find_every_method_call_by_name(install, :generate_completions_from_executable)
+          return if methods.length <= 1
+
+          offenses = []
+          shells = []
+          methods.each do |method|
+            next unless method.source.include?("shells:")
+
+            shells << method.source.match(/shells: \[(:bash|:zsh|:fish)\]/).captures.first
+            offenses << method
+          end
+
+          return if offenses.blank?
+
+          T.must(offenses[0...-1]).each_with_index do |node, i|
+            # commands have to be the same to be combined
+            # send_type? matches `bin/"foo"`, str_type? matches remaining command parts,
+            # the rest are kwargs we need to filter out
+            method_commands = node.arguments.filter { |arg| arg.send_type? || arg.str_type? }
+            next_method_commands = offenses[i + 1].arguments.filter { |arg| arg.send_type? || arg.str_type? }
+            if method_commands != next_method_commands
+              shells.delete_at(i)
+              next
+            end
+
+            offending_node(node)
+            problem "Use a single `generate_completions_from_executable` " \
+                    "call combining all specified shells." do |corrector|
+              # adjust range by -4 and +1 to also include & remove leading spaces and trailing \n
+              corrector.replace(@offensive_node.source_range.adjust(begin_pos: -4, end_pos: 1), "")
+            end
+          end
+
+          return if shells.length <= 1 # no shells to combine left
+
+          offending_node(offenses.last)
+          replacement = if (%w[:bash :zsh :fish] - shells).empty?
+            @offensive_node.source.sub(/shells: \[(:bash|:zsh|:fish)\]/, "")
+                           .sub(", )", ")") # clean up dangling trailing comma
+                           .sub("(, ", "(") # clean up dangling leading comma
+                           .sub(", , ", ", ") # clean up dangling enclosed comma
+          else
+            @offensive_node.source.sub(/shells: \[(:bash|:zsh|:fish)\]/,
+                                       "shells: [#{shells.join(", ")}]")
+          end
+
+          problem "Use `#{replacement}` instead of `#{@offensive_node.source}`." do |corrector|
+            corrector.replace(@offensive_node.source_range, replacement)
+          end
+        end
       end
 
       # This cop checks for other miscellaneous style violations.
-      #
-      # @api private
       class Miscellaneous < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
           # FileUtils is included in Formula
           # encfs modifies a file with this name, so check for some leading characters
           find_instance_method_call(body_node, "FileUtils", nil) do |method_node|
@@ -608,7 +646,7 @@ module RuboCop
           # Check for long inreplace block vars
           find_all_blocks(body_node, :inreplace) do |node|
             block_arg = node.arguments.children.first
-            next unless block_arg.source.size > 1
+            next if block_arg.source.size <= 1
 
             problem "\"inreplace <filenames> do |s|\" is preferred over \"|#{block_arg.source}|\"."
           end
@@ -631,19 +669,23 @@ module RuboCop
 
           # Avoid hard-coding compilers
           find_every_method_call_by_name(body_node, :system).each do |method|
+            next if @formula_name == "bazel" # TODO: Remove shim bypass in bazel.
+
             param = parameters(method).first
-            if (match = regex_match_group(param, %r{^(/usr/bin/)?(gcc|llvm-gcc|clang)(\s|$)}))
+            if (match = regex_match_group(param, %r{^(/usr/bin/)?(gcc|clang|cc|c[89]9)(\s|$)}))
               problem "Use \"\#{ENV.cc}\" instead of hard-coding \"#{match[2]}\""
-            elsif (match = regex_match_group(param, %r{^(/usr/bin/)?((g|llvm-g|clang)\+\+)(\s|$)}))
+            elsif (match = regex_match_group(param, %r{^(/usr/bin/)?((g|clang|c)\+\+)(\s|$)}))
               problem "Use \"\#{ENV.cxx}\" instead of hard-coding \"#{match[2]}\""
             end
           end
 
           find_instance_method_call(body_node, "ENV", :[]=) do |method|
+            next if @formula_name == "bazel" # TODO: Remove shim bypass in bazel.
+
             param = parameters(method)[1]
-            if (match = regex_match_group(param, %r{^(/usr/bin/)?(gcc|llvm-gcc|clang)(\s|$)}))
+            if (match = regex_match_group(param, %r{^(/usr/bin/)?(gcc|clang|cc|c[89]9)(\s|$)}))
               problem "Use \"\#{ENV.cc}\" instead of hard-coding \"#{match[2]}\""
-            elsif (match = regex_match_group(param, %r{^(/usr/bin/)?((g|llvm-g|clang)\+\+)(\s|$)}))
+            elsif (match = regex_match_group(param, %r{^(/usr/bin/)?((g|clang|c)\+\+)(\s|$)}))
               problem "Use \"\#{ENV.cxx}\" instead of hard-coding \"#{match[2]}\""
             end
           end
@@ -657,13 +699,13 @@ module RuboCop
 
           formula_path_strings(body_node, :prefix) do |p|
             if (match = regex_match_group(p, %r{^(/share/(info|man))$}))
-              problem "\"\#\{prefix}#{match[1]}\" should be \"\#{#{match[2]}}\""
+              problem ['"#', "{prefix}", match[1], '" should be "#{', match[2], '}"'].join
             end
             if (match = regex_match_group(p, %r{^((/share/man/)(man[1-8]))}))
-              problem "\"\#\{prefix}#{match[1]}\" should be \"\#{#{match[3]}}\""
+              problem ['"#', "{prefix}", match[1], '" should be "#{', match[3], '}"'].join
             end
             if (match = regex_match_group(p, %r{^(/(bin|include|libexec|lib|sbin|share|Frameworks))}i))
-              problem "\"\#\{prefix}#{match[1]}\" should be \"\#{#{match[2].downcase}}\""
+              problem ['"#', "{prefix}", match[1], '" should be "#{', match[2].downcase, '}"'].join
             end
           end
 
@@ -696,13 +738,13 @@ module RuboCop
           end
 
           find_instance_method_call(body_node, :version, :==) do |method|
-            next unless parameters_passed?(method, "HEAD")
+            next unless parameters_passed?(method, ["HEAD"])
 
             problem "Use 'build.head?' instead of inspecting 'version'"
           end
 
           find_instance_method_call(body_node, "ARGV", :include?) do |method|
-            next unless parameters_passed?(method, "--HEAD")
+            next unless parameters_passed?(method, ["--HEAD"])
 
             problem "Use \"if build.head?\" instead"
           end
@@ -742,18 +784,6 @@ module RuboCop
 
           find_method_with_args(body_node, :system, /^(otool|install_name_tool|lipo)/) do
             problem "Use ruby-macho instead of calling #{@offensive_node.source}"
-          end
-
-          find_every_method_call_by_name(body_node, :system).each do |method_node|
-            # Skip Kibana: npm cache edge (see formula for more details)
-            next if @formula_name.match?(/^kibana(@\d[\d.]*)?$/)
-
-            first_param, second_param = parameters(method_node)
-            next if !node_equals?(first_param, "npm") ||
-                    !node_equals?(second_param, "install")
-
-            offending_node(method_node)
-            problem "Use Language::Node for npm install args" unless languageNodeModule?(method_node)
           end
 
           problem "Use new-style test definitions (test do)" if find_method_def(body_node, :test)
@@ -802,7 +832,7 @@ module RuboCop
           end
 
           find_instance_method_call(body_node, "Dir", :[]) do |method|
-            next unless parameters(method).size == 1
+            next if parameters(method).size != 1
 
             path = parameters(method).first
             next unless path.str_type?
@@ -850,24 +880,18 @@ module RuboCop
           {(dstr (begin (send nil? %1)) $(str _ ))
            (dstr _ (begin (send nil? %1)) $(str _ ))}
         EOS
-
-        # Node Pattern search for Language::Node
-        def_node_search :languageNodeModule?, <<~EOS
-          (const (const nil? :Language) :Node)
-        EOS
       end
     end
 
     module FormulaAuditStrict
       # This cop makes sure that no build-time checks are performed.
-      #
-      # @api private
       class MakeCheck < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, body_node)
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
           return if formula_tap != "homebrew-core"
 
           # Avoid build-time checks in homebrew/core
-          find_every_method_call_by_name(body_node, :system).each do |method|
+          find_every_method_call_by_name(formula_nodes.body_node, :system).each do |method|
             next if @formula_name.start_with?("lib")
             next if tap_style_exception? :make_check_allowlist
 
@@ -887,11 +911,55 @@ module RuboCop
 
       # This cop ensures that new formulae depending on removed Requirements are not used
       class Requirements < FormulaCop
-        def audit_formula(_node, _class_node, _parent_class_node, _body_node)
+        sig { override.params(_formula_nodes: FormulaNodes).void }
+        def audit_formula(_formula_nodes)
           problem "Formulae should depend on a versioned `openjdk` instead of :java" if depends_on? :java
           problem "Formulae should depend on specific X libraries instead of :x11" if depends_on? :x11
           problem "Formulae should not depend on :osxfuse" if depends_on? :osxfuse
           problem "Formulae should not depend on :tuntap" if depends_on? :tuntap
+        end
+      end
+
+      # This cop makes sure that formulae build with `rust` instead of `rustup`.
+      class RustCheck < FormulaCop
+        extend AutoCorrector
+
+        sig { override.params(formula_nodes: FormulaNodes).void }
+        def audit_formula(formula_nodes)
+          return if (body_node = formula_nodes.body_node).nil?
+
+          # Enforce use of `rust` for rust dependency in core
+          return if formula_tap != "homebrew-core"
+
+          find_method_with_args(body_node, :depends_on, "rustup") do
+            problem "Formulae in homebrew/core should use 'depends_on \"rust\"' " \
+                    "instead of '#{@offensive_node.source}'." do |corrector|
+              corrector.replace(@offensive_node.source_range, "depends_on \"rust\"")
+            end
+          end
+
+          # TODO: Enforce order of dependency types so we don't need to check for
+          #       depends_on "rustup" => [:test, :build]
+          [:build, [:build, :test], [:test, :build]].each do |type|
+            find_method_with_args(body_node, :depends_on, "rustup" => type) do
+              problem "Formulae in homebrew/core should use 'depends_on \"rust\" => #{type}' " \
+                      "instead of '#{@offensive_node.source}'." do |corrector|
+                corrector.replace(@offensive_node.source_range, "depends_on \"rust\" => #{type}")
+              end
+            end
+          end
+
+          install_node = find_method_def(body_node, :install)
+          return if install_node.blank?
+
+          find_every_method_call_by_name(install_node, :system).each do |method|
+            param = parameters(method).first
+            next if param.blank?
+            # FIXME: Handle Pathname parameters (e.g. `system bin/"rustup"`).
+            next if regex_match_group(param, /rustup$/).blank?
+
+            problem "Formula in homebrew/core should not use `rustup` at build-time."
+          end
         end
       end
     end

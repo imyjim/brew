@@ -1,10 +1,9 @@
-# typed: false
 # frozen_string_literal: true
 
 require "lock_file"
 
-describe LockFile do
-  subject(:lock_file) { described_class.new("foo") }
+RSpec.describe LockFile do
+  subject(:lock_file) { described_class.new(:lock, Pathname("foo")) }
 
   describe "#lock" do
     it "does not raise an error when already locked" do
@@ -16,9 +15,9 @@ describe LockFile do
     it "raises an error if a lock already exists" do
       lock_file.lock
 
-      expect {
-        described_class.new("foo").lock
-      }.to raise_error(OperationInProgressError)
+      expect do
+        described_class.new(:lock, Pathname("foo")).lock
+      end.to raise_error(OperationInProgressError)
     end
   end
 
@@ -31,7 +30,7 @@ describe LockFile do
       lock_file.lock
       lock_file.unlock
 
-      expect { described_class.new("foo").lock }.not_to raise_error
+      expect { described_class.new(:lock, Pathname("foo")).lock }.not_to raise_error
     end
   end
 end

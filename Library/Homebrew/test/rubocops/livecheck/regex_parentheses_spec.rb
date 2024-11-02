@@ -1,9 +1,8 @@
-# typed: false
 # frozen_string_literal: true
 
 require "rubocops/livecheck"
 
-describe RuboCop::Cop::FormulaAudit::LivecheckRegexParentheses do
+RSpec.describe RuboCop::Cop::FormulaAudit::LivecheckRegexParentheses do
   subject(:cop) { described_class.new }
 
   it "reports an offense when the `regex` call in the livecheck block does not use parentheses" do
@@ -14,7 +13,7 @@ describe RuboCop::Cop::FormulaAudit::LivecheckRegexParentheses do
         livecheck do
           url :stable
           regex %r{href=.*?/formula[._-]v?(\\d+(?:\\.\\d+)+)\\.t}i
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ The `regex` call should always use parentheses.
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ FormulaAudit/LivecheckRegexParentheses: The `regex` call should always use parentheses.
         end
       end
     RUBY
